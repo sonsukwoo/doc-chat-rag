@@ -1,0 +1,25 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+*.env
+
+# Output folders
+outputs/
+backend/outputs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Mac OS
+.DS_Store
+
+# IDE and editors
+.vscode/
+.idea/
