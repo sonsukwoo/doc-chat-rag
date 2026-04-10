@@ -37,6 +37,7 @@ from .utils import (
     format_document_profile_for_prompt,
     guess_primary_picture_label,
     image_to_data_url,
+    is_generic_full_page_figure,
     is_obvious_junk_figure,
     is_short_text_review_candidate,
     is_trivial_short_text_junk,
@@ -214,6 +215,7 @@ def rule_filter_elements(state: PreprocessState) -> dict[str, Any]:
     """Node: 규칙만으로 확실한 junk 요소를 먼저 제거한다."""
     filtered: list[dict[str, Any]] = []
     dropped = 0
+    page_metrics = state.get("page_metrics", {})
 
     for element in state["elements"]:
         item = dict(element)
@@ -228,7 +230,7 @@ def rule_filter_elements(state: PreprocessState) -> dict[str, Any]:
             continue
 
         if category == "figure":
-            drop_reason = is_obvious_junk_figure(item)
+            drop_reason = is_obvious_junk_figure(item, page_metrics)
             if drop_reason:
                 item["drop_reason"] = drop_reason
                 dropped += 1
@@ -589,10 +591,13 @@ def review_single_figure(state: PreprocessState) -> dict[str, Any]:
         )
         payload = result.model_dump()
     except Exception as exc:  # pragma: no cover - runtime model dependency
-        payload = FigureReviewResult(
-            action="keep",
-            summary=fallback_visual_summary(element),
-        ).model_dump()
+        if is_generic_full_page_figure(element, state.get("page_metrics")):
+            payload = FigureReviewResult(action="drop", summary=None).model_dump()
+        else:
+            payload = FigureReviewResult(
+                action="keep",
+                summary=fallback_visual_summary(element),
+            ).model_dump()
 
     return {
         "figure_reviews": {element_id: payload},

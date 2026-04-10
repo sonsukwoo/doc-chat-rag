@@ -21,6 +21,8 @@ JUNK_FIGURE_LABELS = {
     "bar_code",
     "page_thumbnail",
 }
+FULL_PAGE_IMAGE_CONFIDENCE_THRESHOLD = 0.60
+FULL_PAGE_IMAGE_AREA_RATIO_THRESHOLD = 0.55
 TABLE_LIKE_FIGURE_OVERLAP_THRESHOLD = 0.70
 PAGE_COUNTER_PATTERN = re.compile(
     r"^\s*(?:page\s+\d+|\d+\s*(?:/|of)\s*\d+|-?\s*\d+\s*-?)\s*$",
@@ -279,11 +281,59 @@ def looks_like_short_heading(text: str) -> bool:
     return bool(SHORT_HEADING_PATTERN.match(clean_text))
 
 
-def is_obvious_junk_figure(element: dict[str, Any]) -> Optional[str]:
+def is_generic_full_page_figure(
+    element: dict[str, Any],
+    page_metrics: Optional[dict[int, dict[str, float]]] = None,
+) -> bool:
+    """caption 없는 generic full_page_image를 보수적으로 정크로 판단한다."""
+    label, confidence = guess_primary_picture_label(element)
+    if label != "full_page_image" or confidence < FULL_PAGE_IMAGE_CONFIDENCE_THRESHOLD:
+        return False
+
+    caption = clean_render_text(
+        element.get("resolved_caption") or element.get("internal_caption_text") or ""
+    )
+    if caption:
+        return False
+
+    text = clean_render_text(str(element.get("text", ""))).lower()
+    generic_texts = {
+        "",
+        "full page image",
+        "image",
+        "fullpage image",
+    }
+    if text not in generic_texts:
+        return False
+
+    if not page_metrics:
+        return False
+
+    page = int(element.get("page", 1) or 1)
+    page_metric = page_metrics.get(page) or {}
+    page_width = float(page_metric.get("width", 0.0) or 0.0)
+    page_height = float(page_metric.get("height", 0.0) or 0.0)
+    bbox = element.get("bbox")
+    if not bbox or page_width <= 0 or page_height <= 0:
+        return False
+
+    rect = bbox_to_rect(bbox, page_height, element.get("coord_origin"))
+    page_area = page_width * page_height
+    if page_area <= 0:
+        return False
+    return (rect.width * rect.height) / page_area >= FULL_PAGE_IMAGE_AREA_RATIO_THRESHOLD
+
+
+def is_obvious_junk_figure(
+    element: dict[str, Any],
+    page_metrics: Optional[dict[int, dict[str, float]]] = None,
+) -> Optional[str]:
     """규칙만으로 확실히 제거할 수 있는 figure인지 판단한다."""
     label, confidence = guess_primary_picture_label(element)
     if label in JUNK_FIGURE_LABELS and confidence >= 0.55:
         return f"junk_label:{label}"
+    if is_generic_full_page_figure(element, page_metrics):
+        return "junk_full_page_image"
     return None
 
 
