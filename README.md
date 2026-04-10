@@ -1,0 +1,378 @@
+# 📄 Doc-Chat RAG Pipeline
+
+PDF를 단순 문자열로 밀어 넣는 대신, 문서의 구조를 `element 단위 JSON`으로 분해하고 다시 정제해 RAG 친화적인 데이터셋으로 만드는 전처리 파이프라인입니다.
+
+이 프로젝트는 특히 다음 문제를 해결하는 데 초점을 둡니다.
+
+- 표, 그림, 캡션, 헤더/푸터가 섞인 PDF를 구조적으로 분해하기
+- 표/그림을 원본 시각 자산까지 보존한 채 후속 RAG에 연결하기
+- junk 요소를 제거하고, 필요한 visual만 VLM으로 보강하기
+- 최종적으로 `cleaned.json`, `cleaned.md`, `preview.html`까지 재생성하기
+
+---
+
+## 💡 프로젝트 개요
+
+일반적인 PDF 기반 RAG는 문서를 하나의 긴 Markdown 문자열로 바꾼 뒤 청킹합니다. 이 방식은 구현은 단순하지만, 문서의 실제 구조를 잃어버리는 순간 아래 문제가 생깁니다.
+
+- 표가 본문 사이에 섞이며 의미가 깨짐
+- 그림/다이어그램의 시각 정보가 손실됨
+- 헤더, 푸터, 페이지 번호, 로고 같은 노이즈가 본문에 섞임
+- 후속 chunking에서 문단 경계와 구조 제어가 어려워짐
+
+이 저장소는 문서를 먼저 `element list`로 분해한 뒤, LangGraph 기반 2차 전처리에서 문서 맥락을 보고 노이즈 제거, visual crop, figure relevance 판정, table summary 생성을 수행하는 방식을 택합니다.
+
+---
+
+## ✅ 현재 저장소에서 구현된 범위
+
+아래 아키텍처는 최종 목표 기준입니다. 현재 저장소 기준 구현 상태는 다음과 같습니다.
+
+- 구현 완료: `Docling 기반 1차 파싱`, `LangGraph 기반 2차 전처리`, `figure/table crop`, `figure keep/drop 판정`, `table summary`, `Markdown/HTML 재생성`
+- 부분 구현: `문서 프로파일 추론 기반 quality gate`
+- 아직 분리 예정: `OCR Docker 레이어`, `image PDF 자동 라우팅`, `Vector DB 적재/검색 파이프라인`
+
+즉, 현재 코드는 **Phase 2 이후의 구조화/정제 파이프라인이 중심**이고, OCR 레이어는 아키텍처상 분리 포인트로 정의되어 있지만 아직 이 저장소 안에서 완전히 통합되지는 않았습니다.
+
+---
+
+## 🛠 파이프라인 아키텍처 & 플로우 차트
+
+전체 파이프라인은 제어 흐름을 관리하는 LangGraph를 중심으로 크게 **(1) OCR 전처리 레이어**, **(2) 1차 구조화 파싱 (Docling)**, **(3) 지능형 2차 전처리** 세 단계로 이루어집니다.
+
+```mermaid
+flowchart TD
+    subgraph "Phase 0: Input & Routing"
+        A[사용자 PDF 업로드] --> B{LangGraph: PDF 유형 판정}
+        B -- "Image PDF (텍스트 레이어 없음)" --> C
+        B -- "Born-Digital (텍스트 레이어 존재)" --> E
+    end
+
+    subgraph "Phase 1: OCR Isolation (Docker)"
+        C[Docker 컨테이너 내부 OCR 호출\n: ocrmypdf, tesseract] --> D[Searchable PDF 생성]
+    end
+
+    subgraph "Phase 2: 1차 원본 분해 (Docling)"
+        D --> E
+        E[Docling Parser 실행] --> F[문서를 Element JSON으로 구조화\n: 텍스트, 표, 그림 등 블록화]
+        F --> G[시각 요소 분리 및 재수집\n: Bbox 좌표 기반 표/이미지 별도 Crop 저장]
+    end
+
+    subgraph "Phase 3: 지능형 2차 전처리 (LangGraph Agent)"
+        G --> H[LangGraph 전처리 라우팅]
+        H -.-> I[Quality Gate: VLM 개입 여부 등 판단]
+        H --> J[Noise Reduction\n: 광고, 로고, 헤더/푸터 등 Junk 블록 제거]
+        H --> K[Visual Enrichment\n: VLM 활용 필요 표/그림 요약 생성]
+        J & K --> L[Cleaned JSON / Markdown 재생성 및 Chunking 준비]
+    end
+
+    subgraph "Phase 4: Output & RAG"
+        L --> M[Vector DB 적재 기반 마련]
+    end
+
+    style C fill:#ffebee,stroke:#c62828,stroke-width:2px,color:#000
+    style E fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#000
+    style H fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#000
+```
+
+### 노드별 설명
+
+| 노드 | 역할 | 현재 저장소 기준 상태 |
+| --- | --- | --- |
+| A | 사용자가 처리할 PDF를 입력하는 시작 지점 | 개념 정의 |
+| B | PDF가 이미지 PDF인지, 텍스트 레이어가 있는 born-digital PDF인지 판정하는 라우팅 포인트 | 아키텍처상 정의, 아직 자동 분기 미구현 |
+| C | 이미지 PDF에 대해 OCR 컨테이너를 호출해 텍스트 레이어를 복원하는 단계 | 예정 |
+| D | OCR이 끝난 searchable PDF를 만들어 Docling 단계로 넘기는 산출물 | 예정 |
+| E | Docling으로 PDF를 파싱하는 핵심 진입점 | 구현 완료 (`backend/stage1.py`) |
+| F | 문서를 heading, paragraph, table, figure, caption 등 `element JSON`으로 평탄화하는 단계 | 구현 완료 |
+| G | figure/table의 bbox를 기준으로 원본 PDF에서 시각 자산을 crop 저장하는 단계 | 구현 완료 (`crop_visuals`) |
+| H | 2차 전처리 전체 흐름을 LangGraph로 제어하는 라우팅 레이어 | 구현 완료 (`backend/stage2_preprocess/graph.py`) |
+| I | 어떤 visual에만 VLM을 개입시킬지, 어떤 판단을 규칙으로 끝낼지 정하는 quality gate | 부분 구현 |
+| J | 헤더/푸터, 페이지 카운터, 로고/아이콘 등 명백한 junk를 제거하는 단계 | 구현 완료 (`rule_filter_elements`, `clean_elements`) |
+| K | figure relevance 판정, figure summary, table summary를 생성하는 visual enrichment 단계 | 구현 완료 (`review_single_figure`, `summarize_tables`) |
+| L | 정제된 element를 기준으로 `cleaned.json`, `cleaned.md`, `preview.html`을 재생성하는 단계 | 구현 완료 |
+| M | 이후 chunking, embedding, vector DB 적재로 연결되는 출력 경계 | 예정 |
+
+---
+
+## 🔍 현재 코드 기준 실제 처리 흐름
+
+현재 저장소에서 실제로 돌아가는 흐름은 아래 두 단계입니다.
+
+### 1. Stage 1: Docling 기반 Raw Extraction
+
+`backend/stage1.py`가 담당합니다.
+
+- 입력 PDF를 Docling으로 파싱합니다.
+- 문서를 `element list`로 평탄화합니다.
+- 각 element에 `id`, `category`, `page`, `bbox`, `html`, `caption_refs` 등을 붙입니다.
+- table은 Markdown payload를 추가로 저장합니다.
+- figure는 picture classification 결과가 있으면 top-k 후보 라벨을 보존합니다.
+- 결과를 `backend/outputs/<stem>/<stem>.json`으로 저장합니다.
+
+이 단계의 목표는 문서를 "최종 텍스트"로 만드는 것이 아니라, **후속 판단이 가능한 raw 구조 데이터**를 확보하는 것입니다.
+
+### 2. Stage 2: LangGraph 기반 Intelligent Preprocessing
+
+`backend/stage2.py`와 `backend/stage2_preprocess/*`가 담당합니다.
+
+LangGraph 노드는 아래 순서로 연결됩니다.
+
+1. `load_raw_document`: raw JSON과 source PDF를 읽어 상태 초기화
+2. `resolve_captions`: caption ref를 따라 figure/table caption 연결
+3. `normalize_elements`: 텍스트 정리, short heading 승격, picture top-1 label 보강
+4. `infer_document_profile`: 문서 전체 주제와 관련 visual 힌트 추론
+5. `rule_filter_elements`: 헤더/푸터, 페이지 번호, 명백한 junk figure 제거
+6. `build_visual_tasks`: crop/VLM 대상인 figure, table 작업 목록 생성
+7. `crop_visuals`: bbox 기준으로 표/그림 이미지 crop 저장
+8. `review_single_figure`: figure별 keep/drop 및 summary 생성
+9. `summarize_tables`: table별 핵심 summary 생성
+10. `clean_elements`: caption dedupe, table-like figure 중복 제거, visual 결과 반영
+11. `render_markdown`: 최종 Markdown 생성
+12. `render_preview_html`: 검수용 HTML 생성
+13. `write_outputs`: cleaned 산출물 저장
+
+핵심은 **LLM/VLM을 모든 곳에 쓰지 않고**, 규칙 기반으로 확실한 부분은 먼저 정리한 뒤 정말 필요한 visual 판단에만 모델을 개입시키는 점입니다.
+
+---
+
+## 🤖 모델 판단 로직
+
+이 프로젝트에서 모델은 "문서 전체를 다시 쓰는 생성기"가 아니라, **규칙만으로는 애매한 지점만 보조 판단하는 심사기** 역할을 맡습니다.
+
+### 1. `document_profile`은 어떻게 만드는가?
+
+`document_profile`은 figure keep/drop 판단의 기준축이 되는 문서 전역 컨텍스트입니다. [`backend/stage2_preprocess/nodes.py`](/Users/sonseog-u/DEV/01-projects/rag_chat/backend/stage2_preprocess/nodes.py) 의 `infer_document_profile` 노드에서 생성합니다.
+
+생성 방식은 다음과 같습니다.
+
+- 먼저 문서 앞부분의 `heading`과 본문 샘플을 수집합니다.
+- 이때 figure, table, caption, header/footer 같은 요소는 제외합니다.
+- 수집한 heading 후보와 본문 snippet을 구조화 출력 모델에 넣어 문서의 주제와 시각자료 relevance 힌트를 추론합니다.
+
+현재 스키마는 아래 필드를 갖습니다.
+
+- `title`: 문서 대표 제목
+- `document_type`: 기술 문서, 강의 자료, 논문 같은 문서 유형
+- `main_topics`: 문서 핵심 주제 키워드
+- `relevant_visual_types`: 이 문서에서 유의미할 가능성이 높은 visual 유형
+- `irrelevant_visual_hints`: 광고, 배너, 장식 이미지처럼 무관할 가능성이 높은 visual 힌트
+
+즉 `document_profile`은 "이 문서는 대체 무엇에 대한 문서인가?"를 먼저 압축해두고, 이후 figure 판단에서 그 문맥을 계속 재사용하기 위한 장치입니다.
+
+### 2. figure의 keep / drop은 어떻게 결정하는가?
+
+figure는 두 단계로 걸러집니다.
+
+#### 2-1. 규칙 기반 1차 필터
+
+`rule_filter_elements`에서 아래처럼 **명백한 junk**는 모델 호출 전에 제거합니다.
+
+- `page_header`, `page_footer`
+- 페이지 번호처럼 보이는 짧은 텍스트
+- picture classification 결과가 `logo`, `icon`, `qr_code`, `bar_code`, `page_thumbnail`로 강하게 잡힌 figure
+
+즉, 쉽게 버릴 수 있는 것은 먼저 버리고 모델 호출 비용을 줄입니다.
+
+#### 2-2. VLM 기반 2차 판단
+
+남은 figure는 `review_single_figure`에서 개별적으로 검토합니다. 이때 모델 입력은 단순 이미지 하나가 아니라 아래 정보를 함께 받습니다.
+
+- `document_profile`
+- figure의 top-1 picture label과 confidence
+- 연결된 caption
+- 같은 페이지의 텍스트 문맥
+- 실제 crop 이미지
+
+모델은 구조화 스키마로 아래 값을 반환합니다.
+
+- `action`: `keep` 또는 `drop`
+- `document_relevant`: 문서 본문 이해에 직접 도움이 되는지 여부
+- `summary`: `keep`일 때만 생성되는 1~3문장 한국어 요약
+- `reason`: 판단 근거
+
+판단 기준은 매우 보수적으로 잡혀 있습니다.
+
+- 본문 이해에 직접 도움이 되면 `keep`
+- 장식, 광고, 로고, 아이콘, 문맥과 무관한 홍보성 visual이면 `drop`
+- summary에는 실제로 이미지 안에서 식별 가능한 텍스트만 반영
+- 보이지 않는 텍스트나 의미는 추측하지 않음
+
+즉, 같은 "스크린샷"이어도 문서가 제품 매뉴얼이면 `keep`될 수 있고, unrelated 배너 이미지면 `drop`될 수 있습니다. 이 차이를 만드는 기준이 바로 `document_profile + same-page context`입니다.
+
+### 3. table summary는 어떻게 만드는가?
+
+table은 `summarize_tables` 노드에서 처리합니다. figure처럼 keep/drop을 하지 않고, **검색에 도움이 되는 짧은 요약**을 만드는 쪽에 집중합니다.
+
+입력으로 사용되는 정보는 다음과 같습니다.
+
+- table caption
+- 같은 페이지의 주변 텍스트 문맥
+- 원본 table crop 이미지
+
+프롬프트도 복원 중심이 아니라 요약 중심으로 설계돼 있습니다.
+
+- 표를 완벽한 구조로 다시 쓰라고 하지 않음
+- 검색에 도움이 되는 핵심 정보만 1~3문장으로 요약
+- 표 제목, 주요 수치, 비교 축, 분류 기준 같은 핵심만 남김
+
+즉 이 summary는 "표를 다시 그리는 것"이 아니라, **retrieval 단계에서 표가 어떤 내용을 담고 있는지 빠르게 검색되게 만드는 설명 메타데이터**에 가깝습니다.
+
+### 4. summary는 최종 문서에 어떻게 반영되는가?
+
+정제 단계가 끝나면 summary는 cleaned 결과물에 반영됩니다.
+
+- figure는 `visual_summary`
+- table은 `table_summary`
+
+이 값들은 이후:
+
+- `cleaned.json`의 구조화 필드로 남고
+- `cleaned.md`에는 본문에 함께 렌더링되며
+- `preview.html`에서도 사람이 검수할 수 있게 표시됩니다.
+
+그래서 최종 산출물은 단순 텍스트 추출 결과가 아니라, **시각 자료에 대한 추가 검색 단서가 보강된 문서 표현**이 됩니다.
+
+### 5. 모델 실패 시에는 어떻게 처리하는가?
+
+현재 구현은 데이터 손실을 줄이는 쪽으로 fallback을 둡니다.
+
+- figure review 실패 시: caption 또는 picture top-1 label 기반 최소 summary로 대체하고, 기본적으로 `keep` 쪽으로 복구
+- table summary 실패 시: caption 또는 table 텍스트 일부를 이용해 최소 summary 생성
+
+즉 모델이 실패하더라도 파이프라인 전체가 멈추거나 visual 정보가 통째로 사라지지 않도록 설계돼 있습니다.
+
+---
+
+## 🧠 설계 철학
+
+### 1. 왜 곧바로 Markdown으로 쓰지 않고 `JSON Element List`로 강제 분해하는가?
+
+긴 Markdown 문자열 하나로 바꾸면 구조 복구가 거의 불가능해집니다. 반대로 문서를 `heading`, `paragraph`, `table`, `figure`, `caption` 같은 최소 단위로 보존하면 후속 단계에서 훨씬 안정적으로 제어할 수 있습니다.
+
+- junk 요소를 규칙 기반으로 제거하기 쉽습니다.
+- chunking 전에 문단 경계와 구조를 정밀하게 다룰 수 있습니다.
+- page, bbox, caption ref 같은 메타데이터를 잃지 않습니다.
+- visual/text를 별도 정책으로 처리할 수 있습니다.
+
+### 2. 왜 figure와 table을 원본 PDF에서 다시 crop하는가?
+
+표와 다이어그램은 텍스트로만 변환하면 원본 맥락이 깨집니다. 이 프로젝트는 bbox 좌표를 이용해 원본 PDF에서 다시 잘라 저장함으로써 원본 시각 정보를 보존합니다.
+
+- VLM이 원본 이미지를 직접 보고 요약할 수 있습니다.
+- RAG 응답 시 원본 표/그림을 근거 자료로 다시 보여줄 수 있습니다.
+- Markdown 변환이 깨져도 원본 visual이 백업 데이터 역할을 합니다.
+
+### 3. 왜 2차 전처리에 LangGraph를 쓰는가?
+
+문서 전처리는 단순 직렬 스크립트보다 예외 케이스가 훨씬 많습니다. 반대로 모든 결정을 일반 에이전트에게 맡기면 데이터 파손 위험이 커집니다.
+
+LangGraph를 쓰는 이유는 다음과 같습니다.
+
+- 단계별 상태를 명확하게 유지할 수 있습니다.
+- 규칙 기반 처리와 모델 기반 처리를 섞어 쓸 수 있습니다.
+- figure review처럼 fan-out 작업을 노드 단위로 분리할 수 있습니다.
+- 추후 OCR 라우팅, human review, chunking 분기까지 자연스럽게 확장할 수 있습니다.
+
+---
+
+## 📂 프로젝트 구조
+
+```text
+backend/
+├── stage1.py                  # Docling 기반 raw element JSON 생성
+├── stage2.py                  # Stage-2 LangGraph 엔트리포인트
+├── stage2_preprocess/
+│   ├── graph.py               # 그래프 연결 및 라우팅
+│   ├── nodes.py               # 전처리 노드 구현
+│   ├── state.py               # 공유 상태 / structured output schema
+│   ├── utils.py               # bbox, 렌더링, 휴리스틱 유틸
+│   └── llm.py                 # 모델 로딩 및 기본 경로 설정
+└── outputs/                   # 문서별 산출물 저장
+```
+
+---
+
+## 📦 산출물 구조
+
+문서 하나를 처리하면 보통 아래 구조가 생성됩니다.
+
+```text
+backend/outputs/<document_stem>/
+├── <document_stem>.pdf
+├── <document_stem>.json
+├── cleaned.json
+├── cleaned.md
+├── preview.html
+├── figures/
+└── tables/
+```
+
+### 파일별 의미
+
+- `<stem>.json`: Stage-1 raw element list
+- `cleaned.json`: Stage-2 후처리 반영 결과
+- `cleaned.md`: 사람/LLM이 읽기 쉬운 최종 Markdown
+- `preview.html`: 검수용 렌더링 결과
+- `figures/`, `tables/`: 원본 PDF에서 crop한 visual asset
+
+---
+
+## 🚀 실행 방법
+
+현재 버전은 연구/프로토타입 형태라 일부 입력 경로가 코드 상수로 설정되어 있습니다.
+
+### 1. 환경 준비
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+`.env`에는 최소한 아래 값이 필요합니다.
+
+```bash
+OPENAI_API_KEY=...
+OPENAI_VLM_MODEL=openai:gpt-4o-mini
+```
+
+### 2. Stage 1 실행
+
+현재는 [`backend/stage1.py`](/Users/sonseog-u/DEV/01-projects/rag_chat/backend/stage1.py) 내부의 `INPUT_PDF_PATH`를 원하는 PDF 경로로 바꾼 뒤 실행합니다.
+
+```bash
+python -m backend.stage1
+```
+
+실행 후 `backend/outputs/<stem>/<stem>.json`이 생성됩니다.
+
+### 3. Stage 2 실행
+
+현재는 [`backend/stage2_preprocess/llm.py`](/Users/sonseog-u/DEV/01-projects/rag_chat/backend/stage2_preprocess/llm.py) 내부의 `DEFAULT_RAW_JSON_PATH`가 기본 입력입니다.
+
+```bash
+python -m backend.stage2
+```
+
+실행 후 `cleaned.json`, `cleaned.md`, `preview.html`, crop 이미지가 생성됩니다.
+
+---
+
+## 🧪 현재 구현 포인트 요약
+
+- `stage1`은 **raw extraction 전용**입니다.
+- `stage2`는 **정제, visual 판단, 렌더링 전용**입니다.
+- figure는 VLM으로 `keep/drop + summary`를 생성합니다.
+- table은 crop 이미지와 주변 문맥을 바탕으로 summary를 생성합니다.
+- caption 연결, table-like figure 제거, preview HTML 생성까지 포함합니다.
+
+---
+
+## 🗺️ 로드맵
+
+- [ ] OCR Docker 레이어와 현재 파이프라인 통합
+- [ ] PDF 유형 자동 판정 및 OCR 분기 라우팅 구현
+- [ ] chunking 정책과 Vector DB 적재 단계 연결
+- [ ] CLI 인자 기반 실행으로 `INPUT_PDF_PATH` / `DEFAULT_RAW_JSON_PATH` 상수 제거
+- [ ] visual enrichment 품질 평가 및 human review 루프 추가
