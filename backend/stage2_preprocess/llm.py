@@ -19,9 +19,16 @@ load_dotenv(ENV_PATH)
 
 DEFAULT_RAW_JSON_PATH = BACKEND_DIR / "outputs" / "1" / "1.json"
 OPENAI_VLM_MODEL = os.getenv("OPENAI_VLM_MODEL", "openai:gpt-4o-mini")
+OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "openai:gpt-4.1-nano")
 
 
 @lru_cache(maxsize=1)
 def get_base_model():
     """2차 전처리에서 공통으로 사용할 기본 OpenAI 모델을 반환한다."""
     return init_chat_model(OPENAI_VLM_MODEL, temperature=0)
+
+
+@lru_cache(maxsize=1)
+def get_text_model():
+    """짧은 텍스트 정리를 위한 기본 텍스트 모델을 반환한다."""
+    return init_chat_model(OPENAI_TEXT_MODEL, temperature=0)

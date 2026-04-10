@@ -22,6 +22,7 @@ from backend.stage2_preprocess.nodes import (
     infer_document_profile,
     load_raw_document,
     normalize_elements,
+    review_short_text_candidates,
     resolve_captions,
     rule_filter_elements,
 )
@@ -106,6 +107,7 @@ def run_deterministic_stage2(raw_json_path: Path) -> dict[str, Any]:
         state.update(infer_document_profile(state))
 
     state.update(rule_filter_elements(state))
+    state.update(review_short_text_candidates(state))
     state.update(build_visual_tasks(state))
     state.update(crop_visuals(state))
     return state

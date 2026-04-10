@@ -13,22 +13,37 @@ from typing import Any
 import fitz  # PyMuPDF
 from langchain_core.messages import HumanMessage
 
-from .llm import get_base_model
-from .state import DocumentProfileResult, FigureReviewResult, PreprocessState, TableSummaryResult
+from .llm import get_base_model, get_text_model
+from .state import (
+    DocumentProfileResult,
+    FigureReviewResult,
+    PreprocessState,
+    ShortTextContextReviewResult,
+    ShortTextReviewResult,
+    TableSummaryRouteResult,
+    TableSummaryResult,
+)
 from .utils import (
     TABLE_LIKE_FIGURE_OVERLAP_THRESHOLD,
     bbox_overlap_ratio,
     bbox_to_rect,
     clean_render_text,
+    compact_html_for_prompt,
+    collect_neighbor_body_element_ids,
     collect_document_profile_inputs,
     collect_neighbor_body_texts,
     export_cleaned_elements,
     fallback_visual_summary,
+    format_document_profile_for_prompt,
     guess_primary_picture_label,
     image_to_data_url,
     is_obvious_junk_figure,
+    is_short_text_review_candidate,
+    is_trivial_short_text_junk,
     looks_like_page_counter,
     looks_like_short_heading,
+    normalize_short_text_candidate,
+    normalize_whitespace,
     reorder_visual_outliers_by_bbox,
     render_figure_html,
     render_figure_markdown,
@@ -147,7 +162,7 @@ def infer_document_profile(state: PreprocessState) -> dict[str, Any]:
     headings, body_snippets = collect_document_profile_inputs(state["elements"])
     heading_block = "\n".join(f"- {heading}" for heading in headings) or "- (없음)"
     body_block = "\n".join(f"- {snippet}" for snippet in body_snippets) or "- (없음)"
-    profiler = get_base_model().with_structured_output(DocumentProfileResult)
+    profiler = get_text_model().with_structured_output(DocumentProfileResult)
 
     prompt = (
         "너는 문서 전처리기다. 아래 문서 앞부분 요소를 보고 이 문서의 주제를 요약하라. "
@@ -224,6 +239,204 @@ def rule_filter_elements(state: PreprocessState) -> dict[str, Any]:
     return {
         "elements": filtered,
         "logs": [f"rule_filtered:dropped={dropped}:kept={len(filtered)}"],
+    }
+
+# ---------------------------------------------------------------------------
+# review_short_text_candidates 노드
+# 짧은 텍스트 후보를 exact-duplicate 기준으로 batch 검토하고 애매한 경우 문맥으로 재판단한다.
+# ---------------------------------------------------------------------------
+def review_short_text_candidates(state: PreprocessState) -> dict[str, Any]:
+    """Node: 짧은 텍스트 정크를 규칙 + batch LLM으로 정리한다."""
+    elements = [dict(element) for element in state["elements"]]
+    document_profile = state.get("document_profile") or {}
+    profile_text = format_document_profile_for_prompt(document_profile)
+
+    direct_drop_ids: set[int] = set()
+    candidate_groups: dict[str, list[int]] = {}
+    elements_by_id = {int(element["id"]): element for element in elements}
+
+    for element in elements:
+        element_id = int(element["id"])
+        if is_trivial_short_text_junk(element):
+            direct_drop_ids.add(element_id)
+            continue
+        if not is_short_text_review_candidate(element):
+            continue
+
+        normalized_text = normalize_short_text_candidate(element.get("text", ""))
+        if not normalized_text:
+            direct_drop_ids.add(element_id)
+            continue
+        candidate_groups.setdefault(normalized_text, []).append(element_id)
+
+    if not candidate_groups and not direct_drop_ids:
+        return {
+            "elements": elements,
+            "logs": ["short_text_review:candidates=0:groups=0:dropped=0"],
+        }
+
+    reviewer = get_text_model().with_structured_output(ShortTextReviewResult)
+    grouped_requests: list[list[Any]] = []
+    grouped_keys: list[str] = []
+    grouped_results: dict[str, str] = {}
+
+    for normalized_text, element_ids in candidate_groups.items():
+        representative = elements_by_id[element_ids[0]]
+        candidate_text = clean_render_text(representative.get("text", ""))
+        prompt = (
+            "너는 문서 전처리기다. 아래 candidate text를 보고 action을 결정하라. "
+            "문서 본문, 리스트, 담화 표지어처럼 구조에 필요하면 keep, "
+            "UI/광고문구/내비/무의미한 파편, profile_text와 전혀 연관 없는 내용이면 drop, "
+            "단독 텍스트만으로는 판단이 어렵고 앞뒤 문맥이 필요하면 needs_context를 반환하라. "
+            "문서 주제 관련성만 보지 말고 문단 연결과 구조적 역할도 함께 판단하라. "
+            "확실한 잡음만 drop하고, 애매하면 needs_context를 우선하라.\n\n"
+            f"- document profile:\n{profile_text}\n\n"
+            f"- candidate text: {candidate_text or '(없음)'}\n"
+            f"- duplicate count: {len(element_ids)}"
+        )
+        grouped_keys.append(normalized_text)
+        grouped_requests.append([HumanMessage(content=prompt)])
+
+    if grouped_requests:
+        try:
+            grouped_batch_results = reviewer.batch(grouped_requests)
+            for normalized_text, result in zip(grouped_keys, grouped_batch_results, strict=False):
+                grouped_results[normalized_text] = result.action
+        except Exception:
+            for normalized_text in grouped_keys:
+                grouped_results[normalized_text] = "keep"
+
+    drop_ids: set[int] = set(direct_drop_ids)
+    needs_context_ids: list[int] = []
+    for normalized_text, element_ids in candidate_groups.items():
+        action = grouped_results.get(normalized_text, "keep")
+        if action == "drop":
+            drop_ids.update(element_ids)
+        elif action == "needs_context":
+            needs_context_ids.extend(element_ids)
+
+    working_elements = [
+        dict(element)
+        for element in elements
+        if int(element["id"]) not in drop_ids
+    ]
+    context_reviewer = get_text_model().with_structured_output(ShortTextContextReviewResult)
+    context_requests: list[list[Any]] = []
+    context_request_ids: list[int] = []
+    context_actions: dict[int, str] = {}
+
+    for element_id in needs_context_ids:
+        element = elements_by_id.get(element_id)
+        if not element:
+            continue
+
+        prev_text, next_text = collect_neighbor_body_texts(working_elements, element_id)
+        current_text = clean_render_text(element.get("text", ""))
+        prompt = (
+            "너는 문서 전처리기다. 아래 current text는 단독 판단이 어려웠다. "
+            "prev/next 문맥과 document profile을 보고 action을 결정하라. "
+            "독립 요소로 유지하면 keep, 확실한 잡음이면 drop, "
+            "이전 본문 끝에 붙어야 하면 attach_to_prev, 다음 본문 시작에 붙어야 하면 attach_to_next를 반환하라. "
+            "짧은 표지어, 예시/입력/출력 같은 문단 도입부는 종종 attach_to_next가 적절하다. "
+            "확실한 잡음만 drop하고, 애매하면 keep을 선택하라.\n\n"
+            f"- document profile:\n{profile_text}\n\n"
+            f"- previous body text: {prev_text or '(없음)'}\n"
+            f"- current text: {current_text or '(없음)'}\n"
+            f"- next body text: {next_text or '(없음)'}"
+        )
+        context_request_ids.append(element_id)
+        context_requests.append([HumanMessage(content=prompt)])
+
+    if context_requests:
+        try:
+            context_batch_results = context_reviewer.batch(context_requests)
+            for element_id, result in zip(context_request_ids, context_batch_results, strict=False):
+                context_actions[element_id] = result.action
+        except Exception:
+            for element_id in context_request_ids:
+                context_actions[element_id] = "keep"
+
+    for element_id, action in context_actions.items():
+        if action == "drop":
+            drop_ids.add(element_id)
+
+    attach_candidate_ids = {
+        element_id
+        for element_id, action in context_actions.items()
+        if action in {"attach_to_prev", "attach_to_next"} and element_id not in drop_ids
+    }
+    context_base_elements = [
+        dict(element)
+        for element in elements
+        if int(element["id"]) not in drop_ids
+    ]
+    non_target_ids = set(attach_candidate_ids)
+    prefix_map: dict[int, list[str]] = defaultdict(list)
+    suffix_map: dict[int, list[str]] = defaultdict(list)
+
+    for element_id in sorted(attach_candidate_ids):
+        action = context_actions.get(element_id)
+        current_text = clean_render_text(elements_by_id[element_id].get("text", ""))
+        if not current_text:
+            continue
+
+        prev_id, next_id = collect_neighbor_body_element_ids(
+            context_base_elements,
+            element_id,
+            skip_ids=non_target_ids,
+        )
+        if action == "attach_to_prev" and prev_id is not None:
+            suffix_map[prev_id].append(current_text)
+        elif action == "attach_to_next" and next_id is not None:
+            prefix_map[next_id].append(current_text)
+        else:
+            context_actions[element_id] = "keep"
+
+    final_elements: list[dict[str, Any]] = []
+    for element in elements:
+        element_id = int(element["id"])
+        if element_id in drop_ids:
+            continue
+        if context_actions.get(element_id) in {"attach_to_prev", "attach_to_next"}:
+            continue
+
+        item = dict(element)
+        prefixes = prefix_map.get(element_id, [])
+        suffixes = suffix_map.get(element_id, [])
+        if prefixes or suffixes:
+            original_text = clean_render_text(item.get("text", ""))
+            merged_text = normalize_whitespace(
+                " ".join([*prefixes, original_text, *suffixes])
+            )
+            item["text"] = merged_text
+            item["html"] = ""
+
+        final_elements.append(item)
+
+    direct_drop_count = len(direct_drop_ids)
+    grouped_drop_count = sum(1 for action in grouped_results.values() if action == "drop")
+    context_drop_count = sum(1 for action in context_actions.values() if action == "drop")
+    attached_count = sum(
+        1
+        for action in context_actions.values()
+        if action in {"attach_to_prev", "attach_to_next"}
+    )
+
+    return {
+        "elements": final_elements,
+        "logs": [
+            (
+                "short_text_review:"
+                f"candidates={sum(len(ids) for ids in candidate_groups.values())}:"
+                f"groups={len(candidate_groups)}:"
+                f"direct_drop={direct_drop_count}:"
+                f"group_drop={grouped_drop_count}:"
+                f"context_candidates={len(needs_context_ids)}:"
+                f"context_drop={context_drop_count}:"
+                f"attached={attached_count}:"
+                f"final_drop={len(elements) - len(final_elements)}"
+            )
+        ],
     }
 
 # ---------------------------------------------------------------------------
@@ -341,7 +554,7 @@ def review_single_figure(state: PreprocessState) -> dict[str, Any]:
     caption = clean_render_text(
         element.get("resolved_caption") or element.get("internal_caption_text") or ""
     )
-    profile_text = json.dumps(document_profile, ensure_ascii=False, indent=2)
+    profile_text = format_document_profile_for_prompt(document_profile)
     local_context_lines: list[str] = []
     if prev_body_text:
         local_context_lines.append(f"- previous body text: {prev_body_text}")
@@ -349,8 +562,8 @@ def review_single_figure(state: PreprocessState) -> dict[str, Any]:
         local_context_lines.append(f"- next body text: {next_body_text}")
     local_context_block = "\n".join(local_context_lines) or "- 없음"
     prompt = (
-        "이미지를 보고 문서 본문 이해에 직접 도움이 되면 keep, "
-        "문맥과 무관한 광고·장식·로고·아이콘이면 drop으로 판단하라. "
+        "이미지와 document_profile을 보고 이미지가 문서 본문과 관련이 있으면 keep, "
+        "문서와 무관한 광고·장식·로고·아이콘이면 drop으로 판단하라. "
         "판단할 때는 아래 document profile에 담긴 문서 주제와 핵심 토픽을 우선 참고하라. "
         "아래 local body context는 이미지 주변의 본문 텍스트로, 보조 힌트로만 참고하라. "
         "keep이면 RAG 검색에 도움이 되는 한국어 요약을 작성하고, drop이면 summary는 null로 반환하라. "
@@ -391,14 +604,20 @@ def review_single_figure(state: PreprocessState) -> dict[str, Any]:
 # table crop와 현재 markdown을 바탕으로 표 summary를 batch 생성한다.
 # ---------------------------------------------------------------------------
 def summarize_tables(state: PreprocessState) -> dict[str, Any]:
-    """Node: table crop와 현재 markdown을 바탕으로 table summary를 batch로 생성한다."""
+    """Node: table을 html 기반 text summary 또는 image VLM summary로 라우팅해 생성한다."""
     elements_by_id = {int(element["id"]): element for element in state["elements"]}
     cropped_assets = state.get("cropped_assets", {})
     document_profile = state.get("document_profile") or {}
-    summarizer = get_base_model().with_structured_output(TableSummaryResult)
+    table_summaries: dict[int, dict[str, Any]] = {}
+    profile_text = format_document_profile_for_prompt(document_profile)
+    route_reviewer = get_text_model().with_structured_output(TableSummaryRouteResult)
+    text_summarizer = get_text_model().with_structured_output(TableSummaryResult)
+    vlm_summarizer = get_base_model().with_structured_output(TableSummaryResult)
 
-    requests: list[list[Any]] = []
-    request_ids: list[int] = []
+    prepared_inputs: dict[int, dict[str, Any]] = {}
+    route_requests: list[list[Any]] = []
+    route_request_ids: list[int] = []
+    route_results: dict[int, str] = {}
 
     for element_id in state.get("table_summary_ids", []):
         element = elements_by_id.get(element_id)
@@ -409,11 +628,12 @@ def summarize_tables(state: PreprocessState) -> dict[str, Any]:
         caption = clean_render_text(
             element.get("resolved_caption") or element.get("internal_caption_text") or ""
         )
+        html_excerpt = compact_html_for_prompt(element.get("html", ""))
+        text_excerpt = clean_render_text(element.get("text", ""))[:800]
         prev_body_text, next_body_text = collect_neighbor_body_texts(
             state["elements"],
             element_id,
         )
-        profile_text = json.dumps(document_profile, ensure_ascii=False, indent=2)
         local_context_lines: list[str] = []
         if prev_body_text:
             local_context_lines.append(f"- previous body text: {prev_body_text}")
@@ -421,7 +641,71 @@ def summarize_tables(state: PreprocessState) -> dict[str, Any]:
             local_context_lines.append(f"- next body text: {next_body_text}")
         local_context_block = "\n".join(local_context_lines) or "- 없음"
 
-        prompt = (
+        prepared_inputs[element_id] = {
+            "asset": asset,
+            "caption": caption,
+            "html_excerpt": html_excerpt,
+            "text_excerpt": text_excerpt,
+            "local_context_block": local_context_block,
+        }
+
+        if not html_excerpt:
+            route_results[element_id] = "vlm" if asset else "text"
+            continue
+
+        route_prompt = (
+            "아래 table HTML만 보고, 이미지를 보지 않아도 이 표를 한국어로 요약할 수 있는지 판단하라. "
+            "열 이름, 행 이름, 값 구조가 HTML에 충분히 드러나면 text, "
+            "구조가 깨져 있거나 의미 파악이 어려워 이미지 확인이 필요하면 vlm을 반환하라.\n\n"
+            f"- document profile:\n{profile_text}\n\n"
+            f"- caption: {caption or '없음'}\n"
+            f"- table html:\n{html_excerpt}"
+        )
+        route_request_ids.append(element_id)
+        route_requests.append([HumanMessage(content=route_prompt)])
+
+    if route_requests:
+        try:
+            route_batch_results = route_reviewer.batch(route_requests)
+            for element_id, result in zip(route_request_ids, route_batch_results, strict=False):
+                route_results[element_id] = result.route
+        except Exception:
+            for element_id in route_request_ids:
+                asset = prepared_inputs[element_id].get("asset")
+                route_results[element_id] = "vlm" if asset else "text"
+
+    text_requests: list[list[Any]] = []
+    text_request_ids: list[int] = []
+    vlm_requests: list[list[Any]] = []
+    vlm_request_ids: list[int] = []
+
+    for element_id in state.get("table_summary_ids", []):
+        prepared = prepared_inputs.get(element_id)
+        if not prepared:
+            continue
+
+        caption = prepared["caption"]
+        html_excerpt = prepared["html_excerpt"]
+        text_excerpt = prepared["text_excerpt"]
+        local_context_block = prepared["local_context_block"]
+        asset = prepared["asset"]
+        route = route_results.get(element_id, "vlm" if asset else "text")
+
+        if route == "text":
+            source_block = html_excerpt or text_excerpt or "(없음)"
+            text_prompt = (
+                "아래 table HTML을 보고 RAG 검색에 도움이 되도록 핵심만 짧게 한국어로 요약하라. "
+                "표 구조를 복원하려 하지 말고, 제목·열 이름·행 이름·핵심 값 관계가 드러나면 이를 반영하라. "
+                "보이지 않는 내용은 추측하지 말라.\n\n"
+                f"- document profile:\n{profile_text}\n\n"
+                f"- caption: {caption or '없음'}\n"
+                f"- table html:\n{source_block}"
+            )
+            text_request_ids.append(element_id)
+            text_requests.append([HumanMessage(content=text_prompt)])
+            continue
+
+        vlm_prompt = (
             "표의 구조를 복원하지 말고, 이미지를 보고 RAG 검색에 도움이 되도록 핵심만 짧게 한국어로 요약하라. "
             "판단할 때는 아래 document profile에 담긴 문서 주제와 핵심 토픽을 우선 참고하라. "
             "아래 local body context는 표 주변의 본문 텍스트로, 보조 힌트로만 참고하라. "
@@ -430,52 +714,73 @@ def summarize_tables(state: PreprocessState) -> dict[str, Any]:
             f"- caption: {caption or '없음'}\n"
             f"- local body context:\n{local_context_block}"
         )
-
-        messages: list[Any] = []
-
         if asset:
-            messages.append(
-                HumanMessage(
-                    content=[
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_to_data_url(Path(asset["absolute_path"]))},
-                        },
-                    ]
-                )
+            vlm_request_ids.append(element_id)
+            vlm_requests.append(
+                [
+                    HumanMessage(
+                        content=[
+                            {"type": "text", "text": vlm_prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_to_data_url(Path(asset["absolute_path"]))},
+                            },
+                        ]
+                    ),
+                ]
             )
         else:
-            messages.append(HumanMessage(content=prompt))
+            text_request_ids.append(element_id)
+            text_requests.append([HumanMessage(content=vlm_prompt)])
 
-        request_ids.append(element_id)
-        requests.append(messages)
-
-    table_summaries: dict[int, dict[str, Any]] = {}
-    if not requests:
+    if not text_requests and not vlm_requests:
         return {
             "table_summaries": table_summaries,
             "logs": ["table_summaries:0"],
         }
 
-    try:
-        results = summarizer.batch(requests)
-        for element_id, result in zip(request_ids, results, strict=False):
-            table_summaries[element_id] = result.model_dump()
-    except Exception as exc:  # pragma: no cover - runtime model dependency
-        for element_id in request_ids:
-            element = elements_by_id[element_id]
-            caption = clean_render_text(
-                element.get("resolved_caption") or element.get("internal_caption_text") or ""
-            )
-            fallback = caption or clean_render_text(element.get("text", ""))[:240]
-            table_summaries[element_id] = TableSummaryResult(
-                summary=fallback or "표 요약 생성 실패",
-            ).model_dump()
+    if text_requests:
+        try:
+            text_results = text_summarizer.batch(text_requests)
+            for element_id, result in zip(text_request_ids, text_results, strict=False):
+                table_summaries[element_id] = result.model_dump()
+        except Exception:
+            for element_id in text_request_ids:
+                element = elements_by_id[element_id]
+                caption = clean_render_text(
+                    element.get("resolved_caption") or element.get("internal_caption_text") or ""
+                )
+                fallback = caption or clean_render_text(element.get("text", ""))[:240]
+                table_summaries[element_id] = TableSummaryResult(
+                    summary=fallback or "표 요약 생성 실패",
+                ).model_dump()
+
+    if vlm_requests:
+        try:
+            vlm_results = vlm_summarizer.batch(vlm_requests)
+            for element_id, result in zip(vlm_request_ids, vlm_results, strict=False):
+                table_summaries[element_id] = result.model_dump()
+        except Exception:
+            for element_id in vlm_request_ids:
+                element = elements_by_id[element_id]
+                caption = clean_render_text(
+                    element.get("resolved_caption") or element.get("internal_caption_text") or ""
+                )
+                fallback = caption or clean_render_text(element.get("text", ""))[:240]
+                table_summaries[element_id] = TableSummaryResult(
+                    summary=fallback or "표 요약 생성 실패",
+                ).model_dump()
 
     return {
         "table_summaries": table_summaries,
-        "logs": [f"table_summaries:{len(table_summaries)}"],
+        "logs": [
+            (
+                "table_summaries:"
+                f"{len(table_summaries)}:"
+                f"text={len(text_request_ids)}:"
+                f"vlm={len(vlm_request_ids)}"
+            )
+        ],
     }
 
 # ---------------------------------------------------------------------------

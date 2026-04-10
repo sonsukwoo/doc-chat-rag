@@ -18,6 +18,7 @@ from .nodes import (
     normalize_elements,
     render_markdown,
     render_preview_html,
+    review_short_text_candidates,
     resolve_visual_order_outliers,
     resolve_captions,
     review_single_figure,
@@ -70,6 +71,7 @@ preprocess_graph.add_node("resolve_captions", resolve_captions)
 preprocess_graph.add_node("normalize_elements", normalize_elements)
 preprocess_graph.add_node("infer_document_profile", infer_document_profile)
 preprocess_graph.add_node("rule_filter_elements", rule_filter_elements)
+preprocess_graph.add_node("review_short_text_candidates", review_short_text_candidates)
 preprocess_graph.add_node("build_visual_tasks", build_visual_tasks)
 preprocess_graph.add_node("crop_visuals", crop_visuals)
 preprocess_graph.add_node("review_single_figure", review_single_figure)
@@ -85,7 +87,8 @@ preprocess_graph.add_edge("load_raw_document", "resolve_captions")
 preprocess_graph.add_edge("resolve_captions", "normalize_elements")
 preprocess_graph.add_edge("normalize_elements", "infer_document_profile")
 preprocess_graph.add_edge("infer_document_profile", "rule_filter_elements")
-preprocess_graph.add_edge("rule_filter_elements", "build_visual_tasks")
+preprocess_graph.add_edge("rule_filter_elements", "review_short_text_candidates")
+preprocess_graph.add_edge("review_short_text_candidates", "build_visual_tasks")
 preprocess_graph.add_edge("build_visual_tasks", "crop_visuals")
 preprocess_graph.add_conditional_edges(
     "crop_visuals",

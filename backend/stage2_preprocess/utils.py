@@ -38,6 +38,20 @@ CLEANED_JSON_DROP_FIELDS = {
     "primary_picture_label",
     "primary_picture_confidence",
 }
+TEXT_REVIEW_CATEGORIES = {"paragraph", "list", "code"}
+TEXT_CONTEXT_SKIP_CATEGORIES = {"caption", "figure", "table", "page_header", "page_footer"}
+PROTECTED_SHORT_TEXT_BASES = {
+    "예시",
+    "입력",
+    "출력",
+    "주의",
+    "참고",
+    "요약",
+    "정의",
+    "단계",
+    "실습",
+}
+SYMBOL_ONLY_PATTERN = re.compile(r"^[\s\W_]+$")
 
 
 def normalize_whitespace(text: str) -> str:
@@ -58,6 +72,112 @@ def clean_render_text(text: str) -> str:
     )
     cleaned = cleaned.replace("🖼️❌", " ")
     return normalize_whitespace(cleaned)
+
+
+def format_document_profile_for_prompt(profile: dict[str, Any]) -> str:
+    """document_profile을 프롬프트용 짧은 문자열로 압축한다."""
+    if not profile:
+        return "(없음)"
+
+    title = clean_render_text(str(profile.get("title", "")))
+    document_type = clean_render_text(str(profile.get("document_type", "")))
+    main_topics = [
+        clean_render_text(str(topic))
+        for topic in (profile.get("main_topics") or [])
+        if clean_render_text(str(topic))
+    ][:5]
+    relevant_visual_types = [
+        clean_render_text(str(label))
+        for label in (profile.get("relevant_visual_types") or [])
+        if clean_render_text(str(label))
+    ][:5]
+    irrelevant_visual_hints = [
+        clean_render_text(str(hint))
+        for hint in (profile.get("irrelevant_visual_hints") or [])
+        if clean_render_text(str(hint))
+    ][:3]
+
+    parts: list[str] = []
+    if title:
+        parts.append(f"title={title}")
+    if document_type:
+        parts.append(f"type={document_type}")
+    if main_topics:
+        parts.append(f"topics={', '.join(main_topics)}")
+    if relevant_visual_types:
+        parts.append(f"relevant_visuals={', '.join(relevant_visual_types)}")
+    if irrelevant_visual_hints:
+        parts.append(f"irrelevant_hints={', '.join(irrelevant_visual_hints)}")
+
+    return " | ".join(parts) or "(없음)"
+
+
+def compact_html_for_prompt(html: str, max_chars: int = 2400) -> str:
+    """프롬프트 입력용 table HTML을 짧게 압축한다."""
+    if not html:
+        return ""
+
+    compact = re.sub(r"<!--.*?-->", " ", html, flags=re.DOTALL)
+    compact = re.sub(r">\s+<", "><", compact)
+    compact = re.sub(r"\s+", " ", compact).strip()
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 3].rstrip() + "..."
+
+
+def short_text_protection_key(text: str) -> str:
+    """짧은 텍스트 보호 판단용 비교 키를 만든다."""
+    normalized = normalize_whitespace(text)
+    normalized = re.sub(r"^[\"'“”‘’(<\[{]+", "", normalized)
+    normalized = re.sub(r"[\"'“”‘’>)\]}]+$", "", normalized)
+    normalized = re.sub(r"[:：;,.!?]+$", "", normalized)
+    return normalized.strip().lower()
+
+
+def is_protected_short_text(text: str) -> bool:
+    """짧아도 보존해야 하는 담화 마커인지 검사한다."""
+    return short_text_protection_key(text) in PROTECTED_SHORT_TEXT_BASES
+
+
+def is_trivial_short_text_junk(element: dict[str, Any]) -> bool:
+    """규칙만으로 바로 제거할 수 있는 짧은 정크 텍스트인지 검사한다."""
+    if element.get("category") not in TEXT_REVIEW_CATEGORIES:
+        return False
+
+    text = clean_render_text(element.get("text", ""))
+    if not text:
+        return True
+    if is_protected_short_text(text):
+        return False
+    if SYMBOL_ONLY_PATTERN.fullmatch(text):
+        return True
+    if len(text) == 1:
+        return True
+    return False
+
+
+def is_short_text_review_candidate(element: dict[str, Any]) -> bool:
+    """LLM이 검토할 짧은 텍스트 후보인지 검사한다."""
+    if element.get("category") not in TEXT_REVIEW_CATEGORIES:
+        return False
+
+    text = clean_render_text(element.get("text", ""))
+    if not text:
+        return False
+    if is_trivial_short_text_junk(element):
+        return False
+    if is_protected_short_text(text):
+        return False
+    return len(text) <= 60
+
+
+def normalize_short_text_candidate(text: str) -> str:
+    """짧은 텍스트 exact-match 그룹핑용 정규화 문자열을 만든다."""
+    normalized = clean_render_text(text).lower()
+    normalized = re.sub(r"^[\"'“”‘’(<\[{]+", "", normalized)
+    normalized = re.sub(r"[\"'“”‘’>)\]}]+$", "", normalized)
+    normalized = re.sub(r"[:：;,.!?]+$", "", normalized)
+    return normalize_whitespace(normalized)
 
 
 def safe_mkdir(path: Path) -> Path:
@@ -195,6 +315,25 @@ def collect_neighbor_body_texts(
     target_element_id: int,
 ) -> tuple[str, str]:
     """같은 페이지에서 현재 visual 앞뒤의 본문 텍스트를 하나씩 수집한다."""
+    prev_id, next_id = collect_neighbor_body_element_ids(elements, target_element_id)
+    elements_by_id = {int(element.get("id", 0)): element for element in elements}
+    prev_text = ""
+    next_text = ""
+
+    if prev_id is not None:
+        prev_text = clean_render_text(elements_by_id.get(prev_id, {}).get("text", ""))
+    if next_id is not None:
+        next_text = clean_render_text(elements_by_id.get(next_id, {}).get("text", ""))
+    return prev_text, next_text
+
+
+def collect_neighbor_body_element_ids(
+    elements: Sequence[dict[str, Any]],
+    target_element_id: int,
+    *,
+    skip_ids: Optional[set[int]] = None,
+) -> tuple[Optional[int], Optional[int]]:
+    """같은 페이지에서 현재 요소 앞뒤의 본문 element id를 하나씩 찾는다."""
     sorted_elements = sorted(
         elements,
         key=lambda item: int(item.get("order", item.get("id", 0))),
@@ -209,29 +348,33 @@ def collect_neighbor_body_texts(
             break
 
     if target_index is None or target_page is None:
-        return "", ""
+        return None, None
 
-    def _scan(sequence: Sequence[dict[str, Any]]) -> str:
+    def _scan(sequence: Sequence[dict[str, Any]]) -> Optional[int]:
         for element in sequence:
             if int(element.get("page", 1) or 1) != target_page:
                 break
 
+            element_id = int(element.get("id", 0))
+            if skip_ids and element_id in skip_ids:
+                continue
+
             category = element.get("category")
             if category == "heading":
                 break
-            if category in {"caption", "figure", "table", "page_header", "page_footer"}:
+            if category in TEXT_CONTEXT_SKIP_CATEGORIES:
                 continue
-            if category not in {"paragraph", "list"}:
+            if category not in TEXT_REVIEW_CATEGORIES:
                 continue
 
             text = clean_render_text(element.get("text", ""))
             if text:
-                return text
-        return ""
+                return element_id
+        return None
 
-    prev_text = _scan(list(reversed(sorted_elements[:target_index])))
-    next_text = _scan(sorted_elements[target_index + 1 :])
-    return prev_text, next_text
+    prev_id = _scan(list(reversed(sorted_elements[:target_index])))
+    next_id = _scan(sorted_elements[target_index + 1 :])
+    return prev_id, next_id
 
 
 def collect_document_profile_inputs(
