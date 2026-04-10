@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover - runtime dependency
 # ---------------------------------------------------------------------------
 BACKEND_DIR = Path(__file__).resolve().parent
 OUTPUT_ROOT = BACKEND_DIR / "outputs"
-INPUT_PDF_PATH = Path("/Users/sonseog-u/Downloads/데이터/청킹 문서 예제/1.pdf")
+INPUT_PDF_PATH = Path("/Users/sonseog-u/Downloads/데이터/청킹 문서 예제/2.pdf")
 
 # 결과물은 항상 backend 하위에만 저장하고, 테스트 PDF 경로는 여기서 바꿔 쓴다.
 COPY_SOURCE_PDF = True

@@ -18,6 +18,7 @@ from .nodes import (
     normalize_elements,
     render_markdown,
     render_preview_html,
+    resolve_visual_order_outliers,
     resolve_captions,
     review_single_figure,
     rule_filter_elements,
@@ -72,6 +73,7 @@ preprocess_graph.add_node("crop_visuals", crop_visuals)
 preprocess_graph.add_node("review_single_figure", review_single_figure)
 preprocess_graph.add_node("summarize_tables", summarize_tables)
 preprocess_graph.add_node("clean_elements", clean_elements)
+preprocess_graph.add_node("resolve_visual_order_outliers", resolve_visual_order_outliers)
 preprocess_graph.add_node("render_markdown", render_markdown)
 preprocess_graph.add_node("render_preview_html", render_preview_html)
 preprocess_graph.add_node("write_outputs", write_outputs)
@@ -90,7 +92,8 @@ preprocess_graph.add_conditional_edges(
 )
 preprocess_graph.add_edge("review_single_figure", "summarize_tables")
 preprocess_graph.add_edge("summarize_tables", "clean_elements")
-preprocess_graph.add_edge("clean_elements", "render_markdown")
+preprocess_graph.add_edge("clean_elements", "resolve_visual_order_outliers")
+preprocess_graph.add_edge("resolve_visual_order_outliers", "render_markdown")
 preprocess_graph.add_edge("render_markdown", "render_preview_html")
 preprocess_graph.add_edge("render_preview_html", "write_outputs")
 preprocess_graph.add_edge("write_outputs", END)

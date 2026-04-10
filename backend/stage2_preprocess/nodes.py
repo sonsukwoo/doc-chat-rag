@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 
 from .llm import get_base_model
 from .state import DocumentProfileResult, FigureReviewResult, PreprocessState, TableSummaryResult
@@ -22,12 +22,14 @@ from .utils import (
     clean_render_text,
     collect_document_profile_inputs,
     collect_page_context,
+    export_cleaned_elements,
     fallback_visual_summary,
     guess_primary_picture_label,
     image_to_data_url,
     is_obvious_junk_figure,
     looks_like_page_counter,
     looks_like_short_heading,
+    reorder_visual_outliers_by_bbox,
     render_figure_html,
     render_figure_markdown,
     render_table_html,
@@ -165,12 +167,6 @@ def infer_document_profile(state: PreprocessState) -> dict[str, Any]:
     try:
         result = profiler.invoke(
             [
-                SystemMessage(
-                    content=(
-                        "출력은 반드시 구조화 스키마를 따르라. "
-                        "title, document_type, main_topics, relevant_visual_types, irrelevant_visual_hints를 모두 채워라."
-                    )
-                ),
                 HumanMessage(content=prompt),
             ]
         )
@@ -347,12 +343,12 @@ def review_single_figure(state: PreprocessState) -> dict[str, Any]:
     label, confidence = guess_primary_picture_label(element)
     profile_text = json.dumps(document_profile, ensure_ascii=False, indent=2)
     prompt = (
-        "너는 문서 전처리기다. 주어진 이미지를 보고 문서와 관련 있으면 keep, "
-        "문서와 무관한 장식/광고/로고/아이콘이면 drop으로 판단하라. "
-        "특히 문서 전체 주제와 현재 페이지 문맥을 우선 기준으로 relevance를 판단하라. "
-        "keep일 때만 검색에 도움이 되는 짧은 한국어 summary를 작성하라. "
-        "이미지 안에 읽을 수 있는 텍스트가 있으면 제목, 축 라벨, 범례, 버튼명, 메뉴명, 주요 숫자, 단계명 같은 핵심 문구를 summary에 자연스럽게 반영하라. "
-        "단, 보이지 않는 텍스트를 추측하지 말고 실제로 식별 가능한 내용만 포함하라.\n\n"
+        "너는 문서 전처리기다. 이미지를 보고 문서 본문 이해에 직접 도움이 되면 keep, "
+        "광고·장식·로고·아이콘처럼 문맥과 무관하면 drop으로 판단하라. "
+        "판단할 때는 문서 전체 주제와 현재 페이지 문맥을 우선 참고하라. "
+        "keep이면 검색에 도움이 되는 짧은 한국어 요약을 작성하라. "
+        "이미지 안에 읽을 수 있는 텍스트가 있으면 제목, 축 라벨, 범례, 버튼명, 메뉴명, 주요 숫자, 단계명 같은 핵심 문구를 요약에 반영하라. "
+        "보이지 않는 내용은 추측하지 말라.\n\n"
         f"- document profile:\n{profile_text}\n\n"
         f"- picture top1: {label} ({confidence:.3f})\n"
         f"- caption: {caption or '없음'}\n"
@@ -362,14 +358,6 @@ def review_single_figure(state: PreprocessState) -> dict[str, Any]:
     try:
         result = reviewer.invoke(
             [
-                SystemMessage(
-                    content=(
-                        "출력은 반드시 구조화 스키마를 따르라. "
-                        "summary와 reason은 반드시 한국어로 작성하라. "
-                        "drop이면 summary는 null로 둔다. "
-                        "keep일 때는 이미지 안에서 식별 가능한 텍스트를 검색에 도움이 되도록 summary에 반영하라."
-                    )
-                ),
                 HumanMessage(
                     content=[
                         {"type": "text", "text": prompt},
@@ -385,9 +373,7 @@ def review_single_figure(state: PreprocessState) -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover - runtime model dependency
         payload = FigureReviewResult(
             action="keep",
-            document_relevant=True,
             summary=fallback_visual_summary(element),
-            reason=f"vlm_error:{exc}",
         ).model_dump()
 
     return {
@@ -426,9 +412,7 @@ def summarize_tables(state: PreprocessState) -> dict[str, Any]:
             f"- same-page text context:\n{page_context or '(없음)'}"
         )
 
-        messages: list[Any] = [
-            SystemMessage(content="출력은 반드시 구조화 스키마를 따르며, summary와 reason은 한국어로 작성하라."),
-        ]
+        messages: list[Any] = []
 
         if asset:
             messages.append(
@@ -468,7 +452,6 @@ def summarize_tables(state: PreprocessState) -> dict[str, Any]:
             fallback = caption or clean_render_text(element.get("text", ""))[:240]
             table_summaries[element_id] = TableSummaryResult(
                 summary=fallback or "표 요약 생성 실패",
-                reason=f"table_summary_error:{exc}",
             ).model_dump()
 
     return {
@@ -510,7 +493,6 @@ def clean_elements(state: PreprocessState) -> dict[str, Any]:
                 item["image_abs_path"] = asset["absolute_path"]
             if review and review.get("summary"):
                 item["visual_summary"] = review["summary"]
-                item["visual_reason"] = review.get("reason")
 
         if category == "table":
             asset = cropped_assets.get(element_id)
@@ -519,7 +501,6 @@ def clean_elements(state: PreprocessState) -> dict[str, Any]:
                 item["image_abs_path"] = asset["absolute_path"]
             if element_id in table_summaries:
                 item["table_summary"] = table_summaries[element_id]["summary"]
-                item["table_summary_reason"] = table_summaries[element_id].get("reason")
 
         kept.append(item)
 
@@ -553,6 +534,46 @@ def clean_elements(state: PreprocessState) -> dict[str, Any]:
     return {
         "cleaned_elements": final_elements,
         "logs": [f"cleaned_elements:{len(final_elements)}"],
+    }
+
+# ---------------------------------------------------------------------------
+# resolve_visual_order_outliers 노드
+# 같은 페이지의 visual outlier만 bbox 기준으로 보수적으로 재배치한다.
+# ---------------------------------------------------------------------------
+def resolve_visual_order_outliers(state: PreprocessState) -> dict[str, Any]:
+    """Node: figure/table/caption 중 순서가 크게 어긋난 visual만 bbox 기준으로 보정한다."""
+    cleaned_elements = [
+        dict(element) for element in state.get("cleaned_elements", [])
+    ]
+    if not cleaned_elements:
+        return {
+            "cleaned_elements": cleaned_elements,
+            "ordering_resolution": {
+                "applied": False,
+                "adjusted_ids": [],
+                "rank_gap_threshold": 3,
+            },
+            "logs": ["visual_order_resolved:0"],
+        }
+
+    resolved_elements, adjusted_ids = reorder_visual_outliers_by_bbox(
+        cleaned_elements,
+        state["page_metrics"],
+    )
+
+    for resolved_index, element in enumerate(resolved_elements, start=1):
+        element["resolved_order"] = resolved_index
+        if int(element["id"]) in adjusted_ids:
+            element["order_adjusted"] = True
+
+    return {
+        "cleaned_elements": resolved_elements,
+        "ordering_resolution": {
+            "applied": bool(adjusted_ids),
+            "adjusted_ids": adjusted_ids,
+            "rank_gap_threshold": 3,
+        },
+        "logs": [f"visual_order_resolved:{len(adjusted_ids)}"],
     }
 
 # ---------------------------------------------------------------------------
@@ -645,7 +666,8 @@ def write_outputs(state: PreprocessState) -> dict[str, Any]:
             "source_pdf": state["source_pdf_path"],
             "total_pages": state["total_pages"],
             "document_profile": state.get("document_profile"),
-            "elements": state["cleaned_elements"],
+            "ordering_resolution": state.get("ordering_resolution"),
+            "elements": export_cleaned_elements(state["cleaned_elements"]),
         },
     )
     cleaned_md_path = safe_write_text(output_dir / "cleaned.md", state["cleaned_markdown"])

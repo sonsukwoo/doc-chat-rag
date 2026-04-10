@@ -29,6 +29,19 @@ PAGE_COUNTER_PATTERN = re.compile(
 SHORT_HEADING_PATTERN = re.compile(
     r"^\s*(?:\d+\.\s+|[가-하]\.\s+|[A-Za-z]\.\s+|[IVXLC]+\.\s+).+"
 )
+VISUAL_ORDER_CATEGORIES = {"figure", "table", "caption"}
+VISUAL_ORDER_RANK_GAP_THRESHOLD = 3
+CLEANED_JSON_DROP_FIELDS = {
+    "coord_origin",
+    "docling_ref",
+    "image_abs_path",
+    "internal_caption_text",
+    "order_adjusted",
+    "primary_picture_label",
+    "primary_picture_confidence",
+    "visual_reason",
+    "table_summary_reason",
+}
 
 
 def normalize_whitespace(text: str) -> str:
@@ -69,6 +82,17 @@ def safe_write_json(path: Path, payload: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def export_cleaned_elements(elements: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """cleaned.json 저장 시 내부 처리용 필드를 제거한 element 목록을 만든다."""
+    exported: list[dict[str, Any]] = []
+    for element in elements:
+        item = dict(element)
+        for field in CLEANED_JSON_DROP_FIELDS:
+            item.pop(field, None)
+        exported.append(item)
+    return exported
 
 
 def bbox_to_rect(
@@ -209,6 +233,121 @@ def fallback_visual_summary(element: dict[str, Any]) -> Optional[str]:
     if label:
         return f"{label.replace('_', ' ')} 관련 이미지"
     return None
+
+
+def get_bbox_position_key(
+    element: dict[str, Any],
+    page_metrics: dict[int, dict[str, float]],
+) -> tuple[float, float]:
+    """요소 bbox를 읽기 순서 비교용 (top, left) 좌표로 변환한다."""
+    bbox = element.get("bbox")
+    if not bbox:
+        return float("inf"), float("inf")
+
+    page = int(element.get("page", 1) or 1)
+    page_metric = page_metrics.get(page)
+    if not page_metric:
+        return float("inf"), float("inf")
+
+    rect = bbox_to_rect(
+        bbox=bbox,
+        page_height=float(page_metric["height"]),
+        coord_origin=element.get("coord_origin"),
+    )
+    return float(rect.y0), float(rect.x0)
+
+
+def reorder_visual_outliers_by_bbox(
+    elements: Sequence[dict[str, Any]],
+    page_metrics: dict[int, dict[str, float]],
+    rank_gap_threshold: int = VISUAL_ORDER_RANK_GAP_THRESHOLD,
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """Docling 순서를 기본으로 두고 크게 어긋난 visual만 bbox 기준으로 재배치한다."""
+    page_order: list[int] = []
+    page_buckets: dict[int, list[dict[str, Any]]] = {}
+
+    for element in elements:
+        page = int(element.get("page", 1) or 1)
+        if page not in page_buckets:
+            page_order.append(page)
+            page_buckets[page] = []
+        page_buckets[page].append(dict(element))
+
+    resolved: list[dict[str, Any]] = []
+    adjusted_ids: list[int] = []
+
+    for page in page_order:
+        page_elements = page_buckets[page]
+        if len(page_elements) <= 2:
+            resolved.extend(page_elements)
+            continue
+
+        page_elements = sorted(
+            page_elements,
+            key=lambda item: int(item.get("order", item.get("id", 0))),
+        )
+        current_ids = [int(item["id"]) for item in page_elements]
+        current_rank_map = {
+            element_id: rank for rank, element_id in enumerate(current_ids)
+        }
+        id_to_element = {int(item["id"]): item for item in page_elements}
+
+        bbox_sorted = sorted(
+            page_elements,
+            key=lambda item: (
+                *get_bbox_position_key(item, page_metrics),
+                int(item.get("order", item.get("id", 0))),
+            ),
+        )
+        bbox_rank_map = {
+            int(item["id"]): rank for rank, item in enumerate(bbox_sorted)
+        }
+
+        candidate_ids: list[int] = []
+        for item in page_elements:
+            element_id = int(item["id"])
+            category = item.get("category")
+            if category not in VISUAL_ORDER_CATEGORIES or not item.get("bbox"):
+                continue
+
+            current_rank = current_rank_map[element_id]
+            bbox_rank = bbox_rank_map.get(element_id, current_rank)
+            if abs(current_rank - bbox_rank) >= rank_gap_threshold:
+                candidate_ids.append(element_id)
+
+        if not candidate_ids:
+            resolved.extend(page_elements)
+            continue
+
+        working_ids = current_ids[:]
+        for candidate_id in sorted(
+            candidate_ids,
+            key=lambda element_id: (
+                bbox_rank_map[element_id],
+                current_rank_map[element_id],
+            ),
+        ):
+            if candidate_id not in working_ids:
+                continue
+
+            working_ids.remove(candidate_id)
+            candidate_bbox_rank = bbox_rank_map[candidate_id]
+            insert_at = len(working_ids)
+            for index, other_id in enumerate(working_ids):
+                other_rank = bbox_rank_map.get(other_id, current_rank_map[other_id])
+                if other_rank > candidate_bbox_rank:
+                    insert_at = index
+                    break
+            working_ids.insert(insert_at, candidate_id)
+
+        reordered_page = [id_to_element[element_id] for element_id in working_ids]
+        for element_id in candidate_ids:
+            if current_rank_map[element_id] != working_ids.index(element_id):
+                adjusted_ids.append(element_id)
+
+        resolved.extend(reordered_page)
+
+    return resolved, adjusted_ids
 
 
 def render_text_like_markdown(element: dict[str, Any]) -> str:

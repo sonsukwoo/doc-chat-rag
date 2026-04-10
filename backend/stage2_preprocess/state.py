@@ -15,21 +15,13 @@ class FigureReviewResult(BaseModel):
     action: Literal["keep", "drop"] = Field(
         description="문서와 관련 있으면 keep, 무관하면 drop."
     )
-    document_relevant: bool = Field(
-        description="문서 본문 이해에 직접 도움이 되는 figure인지 여부."
-    )
-    summary: Optional[str] = Field(
-        default=None,
-        description="keep인 경우에만 작성하는 1~3문장 한국어 요약.",
-    )
-    reason: str = Field(description="keep 또는 drop 판단 근거를 한국어로 작성.")
+    summary: Optional[str] = Field(description="검색에 도움이 되는 1~3문장 한국어 요약.")
 
 
 class TableSummaryResult(BaseModel):
     """Table summary 결과."""
 
-    summary: str = Field(description="표의 핵심 내용을 1~3문장 한국어로 요약.")
-    reason: str = Field(description="요약 시 참고한 기준 또는 제한 사항을 한국어로 작성.")
+    summary: str = Field(description="검색에 도움이 되는 1~3문장 한국어 요약.")
 
 
 class DocumentProfileResult(BaseModel):
@@ -79,6 +71,7 @@ class PreprocessState(TypedDict, total=False):
     figure_reviews: Annotated[dict[int, dict[str, Any]], merge_review_maps]  # figure id별 keep/drop + summary 결과
     table_summaries: dict[int, dict[str, Any]]  # table id별 summary 결과
     cleaned_elements: list[dict[str, Any]]  # 최종 keep/drop 반영 후 정리된 element 목록
+    ordering_resolution: dict[str, Any]  # bbox 순서 보정 적용 여부와 조정된 element id 목록
     cleaned_markdown: str  # 최종 Markdown 문자열
     preview_html: str  # 검수용 preview HTML 문자열
     output_paths: dict[str, str]  # 저장된 cleaned 결과물 파일 경로 모음
