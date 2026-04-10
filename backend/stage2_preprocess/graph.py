@@ -26,7 +26,7 @@ from .nodes import (
     write_outputs,
 )
 from .state import PreprocessState
-from .utils import collect_page_context
+from .utils import collect_neighbor_body_texts
 
 
 def route_figure_reviews(state: PreprocessState) -> Any:
@@ -39,6 +39,10 @@ def route_figure_reviews(state: PreprocessState) -> Any:
         element = elements_by_id.get(element_id)
         if not asset or not element:
             continue
+        prev_body_text, next_body_text = collect_neighbor_body_texts(
+            state["elements"],
+            element_id,
+        )
 
         sends.append(
             Send(
@@ -49,10 +53,8 @@ def route_figure_reviews(state: PreprocessState) -> Any:
                         "element": element,
                         "absolute_path": asset["absolute_path"],
                         "document_profile": state.get("document_profile", {}),
-                        "page_context": collect_page_context(
-                            state["elements"],
-                            int(element.get("page", 1)),
-                        ),
+                        "prev_body_text": prev_body_text,
+                        "next_body_text": next_body_text,
                     }
                 },
             )

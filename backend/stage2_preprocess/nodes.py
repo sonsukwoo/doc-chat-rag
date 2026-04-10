@@ -21,7 +21,7 @@ from .utils import (
     bbox_to_rect,
     clean_render_text,
     collect_document_profile_inputs,
-    collect_page_context,
+    collect_neighbor_body_texts,
     export_cleaned_elements,
     fallback_visual_summary,
     guess_primary_picture_label,
@@ -334,25 +334,30 @@ def review_single_figure(state: PreprocessState) -> dict[str, Any]:
     element = request["element"]
     image_path = Path(request["absolute_path"])
     document_profile = request.get("document_profile") or {}
-    page_context = request["page_context"]
+    prev_body_text = request.get("prev_body_text") or ""
+    next_body_text = request.get("next_body_text") or ""
     reviewer = get_base_model().with_structured_output(FigureReviewResult)
 
     caption = clean_render_text(
         element.get("resolved_caption") or element.get("internal_caption_text") or ""
     )
-    label, confidence = guess_primary_picture_label(element)
     profile_text = json.dumps(document_profile, ensure_ascii=False, indent=2)
+    local_context_lines: list[str] = []
+    if prev_body_text:
+        local_context_lines.append(f"- previous body text: {prev_body_text}")
+    if next_body_text:
+        local_context_lines.append(f"- next body text: {next_body_text}")
+    local_context_block = "\n".join(local_context_lines) or "- 없음"
     prompt = (
-        "너는 문서 전처리기다. 이미지를 보고 문서 본문 이해에 직접 도움이 되면 keep, "
-        "광고·장식·로고·아이콘처럼 문맥과 무관하면 drop으로 판단하라. "
-        "판단할 때는 문서 전체 주제와 현재 페이지 문맥을 우선 참고하라. "
-        "keep이면 검색에 도움이 되는 짧은 한국어 요약을 작성하라. "
-        "이미지 안에 읽을 수 있는 텍스트가 있으면 제목, 축 라벨, 범례, 버튼명, 메뉴명, 주요 숫자, 단계명 같은 핵심 문구를 요약에 반영하라. "
-        "보이지 않는 내용은 추측하지 말라.\n\n"
+        "이미지를 보고 문서 본문 이해에 직접 도움이 되면 keep, "
+        "문맥과 무관한 광고·장식·로고·아이콘이면 drop으로 판단하라. "
+        "판단할 때는 아래 document profile에 담긴 문서 주제와 핵심 토픽을 우선 참고하라. "
+        "아래 local body context는 이미지 주변의 본문 텍스트로, 보조 힌트로만 참고하라. "
+        "keep이면 RAG 검색에 도움이 되는 한국어 요약을 작성하고, drop이면 summary는 null로 반환하라. "
+        "이미지 안의 식별 가능한 텍스트, 도표, 그래프는 요약에 반영하고, 보이지 않는 내용은 추측하지 말라.\n\n"
         f"- document profile:\n{profile_text}\n\n"
-        f"- picture top1: {label} ({confidence:.3f})\n"
         f"- caption: {caption or '없음'}\n"
-        f"- same-page text context:\n{page_context or '(없음)'}"
+        f"- local body context:\n{local_context_block}"
     )
 
     try:
@@ -389,6 +394,7 @@ def summarize_tables(state: PreprocessState) -> dict[str, Any]:
     """Node: table crop와 현재 markdown을 바탕으로 table summary를 batch로 생성한다."""
     elements_by_id = {int(element["id"]): element for element in state["elements"]}
     cropped_assets = state.get("cropped_assets", {})
+    document_profile = state.get("document_profile") or {}
     summarizer = get_base_model().with_structured_output(TableSummaryResult)
 
     requests: list[list[Any]] = []
@@ -403,13 +409,26 @@ def summarize_tables(state: PreprocessState) -> dict[str, Any]:
         caption = clean_render_text(
             element.get("resolved_caption") or element.get("internal_caption_text") or ""
         )
-        page_context = collect_page_context(state["elements"], int(element.get("page", 1)))
+        prev_body_text, next_body_text = collect_neighbor_body_texts(
+            state["elements"],
+            element_id,
+        )
+        profile_text = json.dumps(document_profile, ensure_ascii=False, indent=2)
+        local_context_lines: list[str] = []
+        if prev_body_text:
+            local_context_lines.append(f"- previous body text: {prev_body_text}")
+        if next_body_text:
+            local_context_lines.append(f"- next body text: {next_body_text}")
+        local_context_block = "\n".join(local_context_lines) or "- 없음"
 
         prompt = (
-            "너는 문서 전처리기다. 표의 구조를 복원하지 말고, 원본 이미지와 주변 문맥을 보고 "
-            "검색에 도움이 되도록 핵심만 짧게 한국어로 요약하라.\n\n"
+            "표의 구조를 복원하지 말고, 이미지를 보고 RAG 검색에 도움이 되도록 핵심만 짧게 한국어로 요약하라. "
+            "판단할 때는 아래 document profile에 담긴 문서 주제와 핵심 토픽을 우선 참고하라. "
+            "아래 local body context는 표 주변의 본문 텍스트로, 보조 힌트로만 참고하라. "
+            "표 안의 식별 가능한 제목, 열 이름, 비교 축, 주요 수치는 요약에 반영하고, 보이지 않는 내용은 추측하지 말라.\n\n"
+            f"- document profile:\n{profile_text}\n\n"
             f"- caption: {caption or '없음'}\n"
-            f"- same-page text context:\n{page_context or '(없음)'}"
+            f"- local body context:\n{local_context_block}"
         )
 
         messages: list[Any] = []
@@ -490,7 +509,6 @@ def clean_elements(state: PreprocessState) -> dict[str, Any]:
             asset = cropped_assets.get(element_id)
             if asset:
                 item["image_path"] = asset["relative_path"]
-                item["image_abs_path"] = asset["absolute_path"]
             if review and review.get("summary"):
                 item["visual_summary"] = review["summary"]
 
@@ -498,7 +516,6 @@ def clean_elements(state: PreprocessState) -> dict[str, Any]:
             asset = cropped_assets.get(element_id)
             if asset:
                 item["image_path"] = asset["relative_path"]
-                item["image_abs_path"] = asset["absolute_path"]
             if element_id in table_summaries:
                 item["table_summary"] = table_summaries[element_id]["summary"]
 
@@ -563,8 +580,6 @@ def resolve_visual_order_outliers(state: PreprocessState) -> dict[str, Any]:
 
     for resolved_index, element in enumerate(resolved_elements, start=1):
         element["resolved_order"] = resolved_index
-        if int(element["id"]) in adjusted_ids:
-            element["order_adjusted"] = True
 
     return {
         "cleaned_elements": resolved_elements,

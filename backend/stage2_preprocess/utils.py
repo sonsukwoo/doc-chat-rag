@@ -34,13 +34,9 @@ VISUAL_ORDER_RANK_GAP_THRESHOLD = 3
 CLEANED_JSON_DROP_FIELDS = {
     "coord_origin",
     "docling_ref",
-    "image_abs_path",
     "internal_caption_text",
-    "order_adjusted",
     "primary_picture_label",
     "primary_picture_confidence",
-    "visual_reason",
-    "table_summary_reason",
 }
 
 
@@ -192,6 +188,50 @@ def collect_page_context(elements: Sequence[dict[str, Any]], page: int) -> str:
             continue
         lines.append(text)
     return "\n".join(lines[:12])
+
+
+def collect_neighbor_body_texts(
+    elements: Sequence[dict[str, Any]],
+    target_element_id: int,
+) -> tuple[str, str]:
+    """같은 페이지에서 현재 visual 앞뒤의 본문 텍스트를 하나씩 수집한다."""
+    sorted_elements = sorted(
+        elements,
+        key=lambda item: int(item.get("order", item.get("id", 0))),
+    )
+    target_index = None
+    target_page = None
+
+    for index, element in enumerate(sorted_elements):
+        if int(element.get("id", 0)) == target_element_id:
+            target_index = index
+            target_page = int(element.get("page", 1) or 1)
+            break
+
+    if target_index is None or target_page is None:
+        return "", ""
+
+    def _scan(sequence: Sequence[dict[str, Any]]) -> str:
+        for element in sequence:
+            if int(element.get("page", 1) or 1) != target_page:
+                break
+
+            category = element.get("category")
+            if category == "heading":
+                break
+            if category in {"caption", "figure", "table", "page_header", "page_footer"}:
+                continue
+            if category not in {"paragraph", "list"}:
+                continue
+
+            text = clean_render_text(element.get("text", ""))
+            if text:
+                return text
+        return ""
+
+    prev_text = _scan(list(reversed(sorted_elements[:target_index])))
+    next_text = _scan(sorted_elements[target_index + 1 :])
+    return prev_text, next_text
 
 
 def collect_document_profile_inputs(

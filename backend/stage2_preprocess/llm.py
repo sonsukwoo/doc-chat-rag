@@ -17,7 +17,7 @@ ENV_PATH = PROJECT_ROOT / ".env"
 
 load_dotenv(ENV_PATH)
 
-DEFAULT_RAW_JSON_PATH = BACKEND_DIR / "outputs" / "2" / "2.json"
+DEFAULT_RAW_JSON_PATH = BACKEND_DIR / "outputs" / "1" / "1.json"
 OPENAI_VLM_MODEL = os.getenv("OPENAI_VLM_MODEL", "openai:gpt-4o-mini")
 
 
