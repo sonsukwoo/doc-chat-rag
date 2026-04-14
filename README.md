@@ -347,7 +347,16 @@ figure처럼 keep/drop을 하지 않고, **검색에 도움이 되는 짧은 요
 
 ### 6. 모델 실패 시에는 어떻게 처리하는가?
 
-현재 구현은 데이터 손실을 줄이는 쪽으로 fallback을 둡니다.
+현재 구현은 **재시도 후 fallback** 방식으로 동작합니다.
+
+- `review_single_figure`
+- `route_table_summaries`
+- `summarize_tables_text`
+- `summarize_tables_vlm`
+
+위 네 노드는 LangGraph `retry_policy`가 붙어 있어, 일시적인 API 오류나 네트워크 오류가 나면 먼저 재시도합니다. 기본 설정은 최대 `3회` 재시도이며, 초기 대기 간격은 `1초`입니다.
+
+그 이후에도 실패하면 데이터 손실을 줄이는 쪽으로 fallback을 사용합니다.
 
 - figure review 실패 시: caption 또는 picture top-1 label 기반 최소 summary로 대체하고, 기본적으로 `keep` 쪽으로 복구
 - 단, `full_page_image`가 generic page image 조건에 해당하면 fallback에서도 다시 `drop`으로 처리해 웹 스크린샷성 정크가 살아남지 않게 합니다
@@ -497,6 +506,8 @@ pip install -r requirements.txt
 OPENAI_API_KEY=...
 OPENAI_VLM_MODEL=openai:gpt-4o-mini
 OPENAI_TEXT_MODEL=openai:gpt-4.1-nano
+STAGE2_MODEL_RETRY_MAX_ATTEMPTS=3
+STAGE2_MODEL_RETRY_INITIAL_INTERVAL=1.0
 LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=...
 LANGSMITH_PROJECT=rag-chat-stage2
@@ -504,6 +515,11 @@ LANGCHAIN_CALLBACKS_BACKGROUND=false
 ```
 
 LangGraph/LangChain 기반 호출은 LangSmith tracing이 자동으로 잡힙니다. 현재 프로젝트는 `.env`에 위 값을 넣으면 별도 코드 수정 없이 stage2의 모델 호출이 LangSmith에 기록됩니다.
+
+- `OPENAI_VLM_MODEL`: figure 검토와 VLM table summary에 사용하는 멀티모달 모델
+- `OPENAI_TEXT_MODEL`: document profile, table route, text table summary에 사용하는 텍스트 모델
+- `STAGE2_MODEL_RETRY_MAX_ATTEMPTS`: 모델 호출 노드의 최대 재시도 횟수
+- `STAGE2_MODEL_RETRY_INITIAL_INTERVAL`: 첫 재시도까지 기다리는 초기 간격(초)
 
 ### 2. Stage 1 실행
 
@@ -525,6 +541,21 @@ python -m backend.stage2
 
 실행 후 `cleaned.json`, `cleaned.md`, `preview.html`, crop 이미지가 생성됩니다.
 
+### 4. 최소 테스트 실행
+
+현재는 stage2 구조 안정화를 위해 최소 smoke test를 함께 둡니다.
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+현재 포함된 테스트는 아래 범위를 확인합니다.
+
+- graph compile smoke test
+- figure request build / send count test
+- table route test
+- clean_elements smoke test
+
 ---
 
 ## 🧪 현재 구현 포인트 요약
@@ -534,6 +565,7 @@ python -m backend.stage2
 - 다만 현재 `stage2`의 정제는 **text filtering**보다 **caption/visual 중심의 보수적 정리**에 가깝습니다.
 - `stage2` 코드는 `backend/stage2_preprocess/` 패키지로 분리해 `state / llm / utils / nodes / graph` 구조로 정리했습니다.
 - `graph.py`는 전역에서 바로 compile하지 않고 `build_graph()`와 `get_agent()`로 lazy 생성합니다.
+- 모델 호출 노드에는 LangGraph `retry_policy`를 붙여, 일시 오류 시 재시도 후 마지막에만 fallback으로 내려가도록 했습니다.
 - `state.py`는 입력 상태, 중간 상태, 출력 상태와 주요 payload 타입을 정의합니다.
 - figure 경로는 `build_figure_review_requests -> route_figure_reviews -> review_single_figure` 순서로 동작합니다.
 - figure는 VLM으로 `keep/drop + summary`를 생성합니다.
@@ -550,6 +582,7 @@ python -m backend.stage2
   - document profile: `title`, `document_type`, `main_topics`, `relevant_visual_types`, `irrelevant_visual_hints`
 - 구조화 출력 노드는 별도 `SystemMessage` 없이 `with_structured_output(...) + HumanMessage prompt` 조합으로 동작합니다.
 - caption 연결, table-like figure 제거, visual bbox 순서 보정, preview HTML 생성까지 포함합니다.
+- `tests/`에는 graph compile, figure send fan-out, table route, clean_elements를 검증하는 최소 테스트 세트를 둡니다.
 
 ### visual 입력 디버그 스크립트
 

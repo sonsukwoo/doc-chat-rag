@@ -12,8 +12,14 @@ from typing import Any
 
 import fitz  # PyMuPDF
 from langchain_core.messages import HumanMessage
+from langgraph.runtime import Runtime
+from langgraph.types import default_retry_on
 
-from .llm import get_base_model, get_text_model
+from .llm import (
+    MODEL_RETRY_MAX_ATTEMPTS,
+    get_base_model,
+    get_text_model,
+)
 from .state import (
     CroppedAsset,
     DocumentProfilePayload,
@@ -59,6 +65,18 @@ from .utils import (
     safe_write_json,
     safe_write_text,
 )
+
+
+def _should_raise_for_retry(
+    exc: Exception,
+    runtime: Runtime[Any],
+    *,
+    max_attempts: int = MODEL_RETRY_MAX_ATTEMPTS,
+) -> bool:
+    """일시 오류면 LangGraph retry_policy가 재시도할 수 있게 예외를 다시 올린다."""
+    attempt = getattr(getattr(runtime, "execution_info", None), "node_attempt", 1)
+    return attempt < max_attempts and default_retry_on(exc)
+
 
 # ---------------------------------------------------------------------------
 # load_raw_document 노드
@@ -373,7 +391,10 @@ def build_figure_review_requests(state: PreprocessState) -> dict[str, Any]:
 # review_single_figure 노드
 # figure 하나를 멀티모달 모델로 검토해 keep/drop과 summary를 만든다.
 # ---------------------------------------------------------------------------
-def review_single_figure(state: PreprocessState) -> dict[str, Any]:
+def review_single_figure(
+    state: PreprocessState,
+    runtime: Runtime[Any],
+) -> dict[str, Any]:
     """Node: figure 하나를 멀티모달 모델로 검토해 keep/drop + summary를 생성한다."""
     request: FigureReviewRequest = state["figure_review_request"]
     element_id = int(request["element_id"])
@@ -422,6 +443,8 @@ def review_single_figure(state: PreprocessState) -> dict[str, Any]:
         )
         payload: FigureReviewPayload = result.model_dump()
     except Exception as exc:  # pragma: no cover - runtime model dependency
+        if _should_raise_for_retry(exc, runtime):
+            raise
         if is_generic_full_page_figure(element, state.get("page_metrics")):
             payload = FigureReviewResult(action="drop", summary=None).model_dump()
         else:
@@ -571,6 +594,7 @@ def _run_text_table_summary_batch(
     text_request_ids: list[int],
     text_requests: list[list[Any]],
     elements_by_id: dict[int, ElementPayload],
+    runtime: Runtime[Any],
 ) -> dict[int, TableSummaryPayload]:
     """text 경로 table summary batch를 실행하고 실패 시 fallback으로 대체한다."""
     summaries: dict[int, TableSummaryPayload] = {}
@@ -581,7 +605,9 @@ def _run_text_table_summary_batch(
         text_results = text_summarizer.batch(text_requests)
         for element_id, result in zip(text_request_ids, text_results, strict=False):
             summaries[element_id] = result.model_dump()
-    except Exception:
+    except Exception as exc:
+        if _should_raise_for_retry(exc, runtime):
+            raise
         for element_id in text_request_ids:
             element = elements_by_id[element_id]
             summaries[element_id] = _build_table_summary_fallback(element)
@@ -595,6 +621,7 @@ def _run_vlm_table_summary_batch(
     vlm_request_ids: list[int],
     vlm_requests: list[list[Any]],
     elements_by_id: dict[int, ElementPayload],
+    runtime: Runtime[Any],
 ) -> dict[int, TableSummaryPayload]:
     """VLM 경로 table summary batch를 실행하고 실패 시 fallback으로 대체한다."""
     summaries: dict[int, TableSummaryPayload] = {}
@@ -605,7 +632,9 @@ def _run_vlm_table_summary_batch(
         vlm_results = vlm_summarizer.batch(vlm_requests)
         for element_id, result in zip(vlm_request_ids, vlm_results, strict=False):
             summaries[element_id] = result.model_dump()
-    except Exception:
+    except Exception as exc:
+        if _should_raise_for_retry(exc, runtime):
+            raise
         for element_id in vlm_request_ids:
             element = elements_by_id[element_id]
             summaries[element_id] = _build_table_summary_fallback(element)
@@ -671,7 +700,10 @@ def prepare_table_summary_inputs(state: PreprocessState) -> dict[str, Any]:
 # route_table_summaries 노드
 # table별로 text/vlm 어느 경로로 summary를 만들지 batch 라우팅한다.
 # ---------------------------------------------------------------------------
-def route_table_summaries(state: PreprocessState) -> dict[str, Any]:
+def route_table_summaries(
+    state: PreprocessState,
+    runtime: Runtime[Any],
+) -> dict[str, Any]:
     """Node: table별 summary 경로를 text/vlm으로 batch 라우팅한다."""
     prepared_inputs: dict[int, TableSummaryInput] = state.get("table_summary_inputs", {})
     seeded_route_results: dict[int, TableSummaryRoute] = dict(
@@ -705,7 +737,9 @@ def route_table_summaries(state: PreprocessState) -> dict[str, Any]:
             route_batch_results = route_reviewer.batch(route_requests)
             for element_id, result in zip(route_request_ids, route_batch_results, strict=False):
                 route_results[element_id] = result.route
-        except Exception:
+        except Exception as exc:
+            if _should_raise_for_retry(exc, runtime):
+                raise
             for element_id in route_request_ids:
                 asset = prepared_inputs[element_id].get("asset")
                 route_results[element_id] = "vlm" if asset else "text"
@@ -732,7 +766,10 @@ def route_table_summaries(state: PreprocessState) -> dict[str, Any]:
 # summarize_tables_text 노드
 # text 경로 table들과 asset이 없는 vlm fallback table들을 text batch로 요약한다.
 # ---------------------------------------------------------------------------
-def summarize_tables_text(state: PreprocessState) -> dict[str, Any]:
+def summarize_tables_text(
+    state: PreprocessState,
+    runtime: Runtime[Any],
+) -> dict[str, Any]:
     """Node: text 모델로 처리 가능한 table summary를 batch 생성한다."""
     prepared_inputs: dict[int, TableSummaryInput] = state.get("table_summary_inputs", {})
     route_results: dict[int, TableSummaryRoute] = state.get("table_summary_routes", {})
@@ -781,6 +818,7 @@ def summarize_tables_text(state: PreprocessState) -> dict[str, Any]:
         text_request_ids=text_request_ids,
         text_requests=text_requests,
         elements_by_id=elements_by_id,
+        runtime=runtime,
     )
 
     return {
@@ -793,7 +831,10 @@ def summarize_tables_text(state: PreprocessState) -> dict[str, Any]:
 # summarize_tables_vlm 노드
 # image가 필요한 table들을 VLM batch로 요약한다.
 # ---------------------------------------------------------------------------
-def summarize_tables_vlm(state: PreprocessState) -> dict[str, Any]:
+def summarize_tables_vlm(
+    state: PreprocessState,
+    runtime: Runtime[Any],
+) -> dict[str, Any]:
     """Node: VLM이 필요한 table summary를 batch 생성한다."""
     prepared_inputs: dict[int, TableSummaryInput] = state.get("table_summary_inputs", {})
     route_results: dict[int, TableSummaryRoute] = state.get("table_summary_routes", {})
@@ -843,6 +884,7 @@ def summarize_tables_vlm(state: PreprocessState) -> dict[str, Any]:
         vlm_request_ids=vlm_request_ids,
         vlm_requests=vlm_requests,
         elements_by_id=elements_by_id,
+        runtime=runtime,
     )
 
     return {

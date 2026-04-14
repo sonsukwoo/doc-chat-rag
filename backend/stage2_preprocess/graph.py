@@ -7,9 +7,13 @@ from functools import lru_cache
 from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
+from langgraph.types import RetryPolicy, Send
 
-from .llm import DEFAULT_RAW_JSON_PATH
+from .llm import (
+    DEFAULT_RAW_JSON_PATH,
+    MODEL_RETRY_INITIAL_INTERVAL,
+    MODEL_RETRY_MAX_ATTEMPTS,
+)
 from .nodes import (
     build_figure_review_requests,
     build_visual_tasks,
@@ -34,6 +38,12 @@ from .state import (
     PreprocessInputState,
     PreprocessOutputState,
     PreprocessState,
+)
+
+
+MODEL_CALL_RETRY_POLICY = RetryPolicy(
+    max_attempts=MODEL_RETRY_MAX_ATTEMPTS,
+    initial_interval=MODEL_RETRY_INITIAL_INTERVAL,
 )
 
 
@@ -96,11 +106,27 @@ def _register_nodes(graph: StateGraph) -> None:
     graph.add_node("build_visual_tasks", build_visual_tasks)
     graph.add_node("crop_visuals", crop_visuals)
     graph.add_node("build_figure_review_requests", build_figure_review_requests)
-    graph.add_node("review_single_figure", review_single_figure)
+    graph.add_node(
+        "review_single_figure",
+        review_single_figure,
+        retry_policy=MODEL_CALL_RETRY_POLICY,
+    )
     graph.add_node("prepare_table_summary_inputs", prepare_table_summary_inputs)
-    graph.add_node("route_table_summaries", route_table_summaries)
-    graph.add_node("summarize_tables_text", summarize_tables_text)
-    graph.add_node("summarize_tables_vlm", summarize_tables_vlm)
+    graph.add_node(
+        "route_table_summaries",
+        route_table_summaries,
+        retry_policy=MODEL_CALL_RETRY_POLICY,
+    )
+    graph.add_node(
+        "summarize_tables_text",
+        summarize_tables_text,
+        retry_policy=MODEL_CALL_RETRY_POLICY,
+    )
+    graph.add_node(
+        "summarize_tables_vlm",
+        summarize_tables_vlm,
+        retry_policy=MODEL_CALL_RETRY_POLICY,
+    )
     graph.add_node("clean_elements", clean_elements)
     graph.add_node("resolve_visual_order_outliers", resolve_visual_order_outliers)
     graph.add_node("render_markdown", render_markdown)
