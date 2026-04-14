@@ -24,13 +24,6 @@ JUNK_FIGURE_LABELS = {
 FULL_PAGE_IMAGE_CONFIDENCE_THRESHOLD = 0.60
 FULL_PAGE_IMAGE_AREA_RATIO_THRESHOLD = 0.55
 TABLE_LIKE_FIGURE_OVERLAP_THRESHOLD = 0.70
-PAGE_COUNTER_PATTERN = re.compile(
-    r"^\s*(?:page\s+\d+|\d+\s*(?:/|of)\s*\d+|-?\s*\d+\s*-?)\s*$",
-    re.IGNORECASE,
-)
-SHORT_HEADING_PATTERN = re.compile(
-    r"^\s*(?:\d+\.\s+|[가-하]\.\s+|[A-Za-z]\.\s+|[IVXLC]+\.\s+).+"
-)
 VISUAL_ORDER_CATEGORIES = {"figure", "table", "caption"}
 VISUAL_ORDER_RANK_GAP_THRESHOLD = 3
 CLEANED_JSON_DROP_FIELDS = {
@@ -40,20 +33,8 @@ CLEANED_JSON_DROP_FIELDS = {
     "primary_picture_label",
     "primary_picture_confidence",
 }
-TEXT_REVIEW_CATEGORIES = {"paragraph", "list", "code"}
-TEXT_CONTEXT_SKIP_CATEGORIES = {"caption", "figure", "table", "page_header", "page_footer"}
-PROTECTED_SHORT_TEXT_BASES = {
-    "예시",
-    "입력",
-    "출력",
-    "주의",
-    "참고",
-    "요약",
-    "정의",
-    "단계",
-    "실습",
-}
-SYMBOL_ONLY_PATTERN = re.compile(r"^[\s\W_]+$")
+BODY_CONTEXT_CATEGORIES = {"paragraph", "list", "code"}
+BODY_CONTEXT_SKIP_CATEGORIES = {"caption", "figure", "table", "page_header", "page_footer"}
 
 
 def normalize_whitespace(text: str) -> str:
@@ -125,61 +106,6 @@ def compact_html_for_prompt(html: str, max_chars: int = 2400) -> str:
     if len(compact) <= max_chars:
         return compact
     return compact[: max_chars - 3].rstrip() + "..."
-
-
-def short_text_protection_key(text: str) -> str:
-    """짧은 텍스트 보호 판단용 비교 키를 만든다."""
-    normalized = normalize_whitespace(text)
-    normalized = re.sub(r"^[\"'“”‘’(<\[{]+", "", normalized)
-    normalized = re.sub(r"[\"'“”‘’>)\]}]+$", "", normalized)
-    normalized = re.sub(r"[:：;,.!?]+$", "", normalized)
-    return normalized.strip().lower()
-
-
-def is_protected_short_text(text: str) -> bool:
-    """짧아도 보존해야 하는 담화 마커인지 검사한다."""
-    return short_text_protection_key(text) in PROTECTED_SHORT_TEXT_BASES
-
-
-def is_trivial_short_text_junk(element: dict[str, Any]) -> bool:
-    """규칙만으로 바로 제거할 수 있는 짧은 정크 텍스트인지 검사한다."""
-    if element.get("category") not in TEXT_REVIEW_CATEGORIES:
-        return False
-
-    text = clean_render_text(element.get("text", ""))
-    if not text:
-        return True
-    if is_protected_short_text(text):
-        return False
-    if SYMBOL_ONLY_PATTERN.fullmatch(text):
-        return True
-    if len(text) == 1:
-        return True
-    return False
-
-
-def is_short_text_review_candidate(element: dict[str, Any]) -> bool:
-    """LLM이 검토할 짧은 텍스트 후보인지 검사한다."""
-    if element.get("category") not in TEXT_REVIEW_CATEGORIES:
-        return False
-
-    text = clean_render_text(element.get("text", ""))
-    if not text:
-        return False
-    if is_trivial_short_text_junk(element):
-        return False
-    if is_protected_short_text(text):
-        return False
-    return len(text) <= 60
-
-
-def normalize_short_text_candidate(text: str) -> str:
-    """짧은 텍스트 exact-match 그룹핑용 정규화 문자열을 만든다."""
-    normalized = clean_render_text(text).lower()
-    normalized = re.sub(r"^[\"'“”‘’(<\[{]+", "", normalized)
-    normalized = re.sub(r"[\"'“”‘’>)\]}]+$", "", normalized)
-    normalized = re.sub(r"[:：;,.!?]+$", "", normalized)
-    return normalize_whitespace(normalized)
 
 
 def safe_mkdir(path: Path) -> Path:
@@ -266,19 +192,6 @@ def guess_primary_picture_label(element: dict[str, Any]) -> tuple[Optional[str],
         return None, 0.0
     first = candidates[0]
     return first.get("label"), float(first.get("confidence", 0.0) or 0.0)
-
-
-def looks_like_page_counter(text: str) -> bool:
-    """페이지 카운터처럼 보이는 짧은 텍스트인지 검사한다."""
-    return bool(PAGE_COUNTER_PATTERN.match(text or ""))
-
-
-def looks_like_short_heading(text: str) -> bool:
-    """짧은 번호형 문구를 heading 승격 후보로 판단한다."""
-    clean_text = clean_render_text(text)
-    if len(clean_text) > 60:
-        return False
-    return bool(SHORT_HEADING_PATTERN.match(clean_text))
 
 
 def is_generic_full_page_figure(
@@ -412,9 +325,9 @@ def collect_neighbor_body_element_ids(
             category = element.get("category")
             if category == "heading":
                 break
-            if category in TEXT_CONTEXT_SKIP_CATEGORIES:
+            if category in BODY_CONTEXT_SKIP_CATEGORIES:
                 continue
-            if category not in TEXT_REVIEW_CATEGORIES:
+            if category not in BODY_CONTEXT_CATEGORIES:
                 continue
 
             text = clean_render_text(element.get("text", ""))

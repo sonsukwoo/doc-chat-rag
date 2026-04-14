@@ -32,28 +32,6 @@ class TableSummaryRouteResult(BaseModel):
     )
 
 
-class ShortTextReviewResult(BaseModel):
-    """짧은 텍스트 1차 검토 결과."""
-
-    action: Literal["keep", "drop", "needs_context"] = Field(
-        description=(
-            "짧은 텍스트가 본문 구조나 문장 흐름에 필요하면 keep, "
-            "명백한 잡음이면 drop, 단독으로 판단이 어려우면 needs_context."
-        )
-    )
-
-
-class ShortTextContextReviewResult(BaseModel):
-    """짧은 텍스트 2차 문맥 검토 결과."""
-
-    action: Literal["keep", "drop", "attach_to_prev", "attach_to_next"] = Field(
-        description=(
-            "독립 요소로 유지하면 keep, 제거하면 drop, "
-            "이전 본문 요소에 붙이면 attach_to_prev, 다음 본문 요소에 붙이면 attach_to_next."
-        )
-    )
-
-
 class DocumentProfileResult(BaseModel):
     """문서 전체 맥락을 요약한 프로파일."""
 

@@ -18,8 +18,6 @@ from .state import (
     DocumentProfileResult,
     FigureReviewResult,
     PreprocessState,
-    ShortTextContextReviewResult,
-    ShortTextReviewResult,
     TableSummaryRouteResult,
     TableSummaryResult,
 )
@@ -29,7 +27,6 @@ from .utils import (
     bbox_to_rect,
     clean_render_text,
     compact_html_for_prompt,
-    collect_neighbor_body_element_ids,
     collect_document_profile_inputs,
     collect_neighbor_body_texts,
     export_cleaned_elements,
@@ -39,12 +36,6 @@ from .utils import (
     image_to_data_url,
     is_generic_full_page_figure,
     is_obvious_junk_figure,
-    is_short_text_review_candidate,
-    is_trivial_short_text_junk,
-    looks_like_page_counter,
-    looks_like_short_heading,
-    normalize_short_text_candidate,
-    normalize_whitespace,
     reorder_visual_outliers_by_bbox,
     render_figure_html,
     render_figure_markdown,
@@ -124,10 +115,10 @@ def resolve_captions(state: PreprocessState) -> dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # normalize_elements 노드
-# 텍스트를 정리하고 heading 승격 및 picture top-1 보조 필드를 붙인다.
+# 텍스트를 정리하고 picture top-1 보조 필드를 붙인다.
 # ---------------------------------------------------------------------------
 def normalize_elements(state: PreprocessState) -> dict[str, Any]:
-    """Node: 텍스트 정리, heading 승격, picture top-1 보조 필드 추가를 수행한다."""
+    """Node: 텍스트 정리와 picture top-1 보조 필드 추가를 수행한다."""
     normalized: list[dict[str, Any]] = []
 
     for element in state["elements"]:
@@ -137,10 +128,6 @@ def normalize_elements(state: PreprocessState) -> dict[str, Any]:
             item["internal_caption_text"] = clean_render_text(item["internal_caption_text"])
         if item.get("resolved_caption"):
             item["resolved_caption"] = clean_render_text(item["resolved_caption"])
-
-        if item.get("category") == "paragraph" and looks_like_short_heading(item.get("text", "")):
-            item["raw_category"] = item["category"]
-            item["category"] = "heading"
 
         label, confidence = guess_primary_picture_label(item)
         if label:
@@ -209,10 +196,10 @@ def infer_document_profile(state: PreprocessState) -> dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # rule_filter_elements 노드
-# 규칙만으로 확실한 junk 요소를 먼저 제거한다.
+# 규칙만으로 확실한 visual junk 요소만 먼저 제거한다.
 # ---------------------------------------------------------------------------
 def rule_filter_elements(state: PreprocessState) -> dict[str, Any]:
-    """Node: 규칙만으로 확실한 junk 요소를 먼저 제거한다."""
+    """Node: 규칙만으로 확실한 visual junk 요소만 먼저 제거한다."""
     filtered: list[dict[str, Any]] = []
     dropped = 0
     page_metrics = state.get("page_metrics", {})
@@ -220,14 +207,6 @@ def rule_filter_elements(state: PreprocessState) -> dict[str, Any]:
     for element in state["elements"]:
         item = dict(element)
         category = item.get("category")
-
-        if category in {"page_header", "page_footer"}:
-            dropped += 1
-            continue
-
-        if looks_like_page_counter(item.get("text", "")):
-            dropped += 1
-            continue
 
         if category == "figure":
             drop_reason = is_obvious_junk_figure(item, page_metrics)
@@ -241,204 +220,6 @@ def rule_filter_elements(state: PreprocessState) -> dict[str, Any]:
     return {
         "elements": filtered,
         "logs": [f"rule_filtered:dropped={dropped}:kept={len(filtered)}"],
-    }
-
-# ---------------------------------------------------------------------------
-# review_short_text_candidates 노드
-# 짧은 텍스트 후보를 exact-duplicate 기준으로 batch 검토하고 애매한 경우 문맥으로 재판단한다.
-# ---------------------------------------------------------------------------
-def review_short_text_candidates(state: PreprocessState) -> dict[str, Any]:
-    """Node: 짧은 텍스트 정크를 규칙 + batch LLM으로 정리한다."""
-    elements = [dict(element) for element in state["elements"]]
-    document_profile = state.get("document_profile") or {}
-    profile_text = format_document_profile_for_prompt(document_profile)
-
-    direct_drop_ids: set[int] = set()
-    candidate_groups: dict[str, list[int]] = {}
-    elements_by_id = {int(element["id"]): element for element in elements}
-
-    for element in elements:
-        element_id = int(element["id"])
-        if is_trivial_short_text_junk(element):
-            direct_drop_ids.add(element_id)
-            continue
-        if not is_short_text_review_candidate(element):
-            continue
-
-        normalized_text = normalize_short_text_candidate(element.get("text", ""))
-        if not normalized_text:
-            direct_drop_ids.add(element_id)
-            continue
-        candidate_groups.setdefault(normalized_text, []).append(element_id)
-
-    if not candidate_groups and not direct_drop_ids:
-        return {
-            "elements": elements,
-            "logs": ["short_text_review:candidates=0:groups=0:dropped=0"],
-        }
-
-    reviewer = get_text_model().with_structured_output(ShortTextReviewResult)
-    grouped_requests: list[list[Any]] = []
-    grouped_keys: list[str] = []
-    grouped_results: dict[str, str] = {}
-
-    for normalized_text, element_ids in candidate_groups.items():
-        representative = elements_by_id[element_ids[0]]
-        candidate_text = clean_render_text(representative.get("text", ""))
-        prompt = (
-            "너는 문서 전처리기다. 아래 candidate text를 보고 action을 결정하라. "
-            "문서 본문, 리스트, 담화 표지어처럼 구조에 필요하면 keep, "
-            "UI/광고문구/내비/무의미한 파편, profile_text와 전혀 연관 없는 내용이면 drop, "
-            "단독 텍스트만으로는 판단이 어렵고 앞뒤 문맥이 필요하면 needs_context를 반환하라. "
-            "문서 주제 관련성만 보지 말고 문단 연결과 구조적 역할도 함께 판단하라. "
-            "확실한 잡음만 drop하고, 애매하면 needs_context를 우선하라.\n\n"
-            f"- document profile:\n{profile_text}\n\n"
-            f"- candidate text: {candidate_text or '(없음)'}\n"
-            f"- duplicate count: {len(element_ids)}"
-        )
-        grouped_keys.append(normalized_text)
-        grouped_requests.append([HumanMessage(content=prompt)])
-
-    if grouped_requests:
-        try:
-            grouped_batch_results = reviewer.batch(grouped_requests)
-            for normalized_text, result in zip(grouped_keys, grouped_batch_results, strict=False):
-                grouped_results[normalized_text] = result.action
-        except Exception:
-            for normalized_text in grouped_keys:
-                grouped_results[normalized_text] = "keep"
-
-    drop_ids: set[int] = set(direct_drop_ids)
-    needs_context_ids: list[int] = []
-    for normalized_text, element_ids in candidate_groups.items():
-        action = grouped_results.get(normalized_text, "keep")
-        if action == "drop":
-            drop_ids.update(element_ids)
-        elif action == "needs_context":
-            needs_context_ids.extend(element_ids)
-
-    working_elements = [
-        dict(element)
-        for element in elements
-        if int(element["id"]) not in drop_ids
-    ]
-    context_reviewer = get_text_model().with_structured_output(ShortTextContextReviewResult)
-    context_requests: list[list[Any]] = []
-    context_request_ids: list[int] = []
-    context_actions: dict[int, str] = {}
-
-    for element_id in needs_context_ids:
-        element = elements_by_id.get(element_id)
-        if not element:
-            continue
-
-        prev_text, next_text = collect_neighbor_body_texts(working_elements, element_id)
-        current_text = clean_render_text(element.get("text", ""))
-        prompt = (
-            "너는 문서 전처리기다. 아래 current text는 단독 판단이 어려웠다. "
-            "prev/next 문맥과 document profile을 보고 action을 결정하라. "
-            "독립 요소로 유지하면 keep, 확실한 잡음이면 drop, "
-            "이전 본문 끝에 붙어야 하면 attach_to_prev, 다음 본문 시작에 붙어야 하면 attach_to_next를 반환하라. "
-            "짧은 표지어, 예시/입력/출력 같은 문단 도입부는 종종 attach_to_next가 적절하다. "
-            "확실한 잡음만 drop하고, 애매하면 keep을 선택하라.\n\n"
-            f"- document profile:\n{profile_text}\n\n"
-            f"- previous body text: {prev_text or '(없음)'}\n"
-            f"- current text: {current_text or '(없음)'}\n"
-            f"- next body text: {next_text or '(없음)'}"
-        )
-        context_request_ids.append(element_id)
-        context_requests.append([HumanMessage(content=prompt)])
-
-    if context_requests:
-        try:
-            context_batch_results = context_reviewer.batch(context_requests)
-            for element_id, result in zip(context_request_ids, context_batch_results, strict=False):
-                context_actions[element_id] = result.action
-        except Exception:
-            for element_id in context_request_ids:
-                context_actions[element_id] = "keep"
-
-    for element_id, action in context_actions.items():
-        if action == "drop":
-            drop_ids.add(element_id)
-
-    attach_candidate_ids = {
-        element_id
-        for element_id, action in context_actions.items()
-        if action in {"attach_to_prev", "attach_to_next"} and element_id not in drop_ids
-    }
-    context_base_elements = [
-        dict(element)
-        for element in elements
-        if int(element["id"]) not in drop_ids
-    ]
-    non_target_ids = set(attach_candidate_ids)
-    prefix_map: dict[int, list[str]] = defaultdict(list)
-    suffix_map: dict[int, list[str]] = defaultdict(list)
-
-    for element_id in sorted(attach_candidate_ids):
-        action = context_actions.get(element_id)
-        current_text = clean_render_text(elements_by_id[element_id].get("text", ""))
-        if not current_text:
-            continue
-
-        prev_id, next_id = collect_neighbor_body_element_ids(
-            context_base_elements,
-            element_id,
-            skip_ids=non_target_ids,
-        )
-        if action == "attach_to_prev" and prev_id is not None:
-            suffix_map[prev_id].append(current_text)
-        elif action == "attach_to_next" and next_id is not None:
-            prefix_map[next_id].append(current_text)
-        else:
-            context_actions[element_id] = "keep"
-
-    final_elements: list[dict[str, Any]] = []
-    for element in elements:
-        element_id = int(element["id"])
-        if element_id in drop_ids:
-            continue
-        if context_actions.get(element_id) in {"attach_to_prev", "attach_to_next"}:
-            continue
-
-        item = dict(element)
-        prefixes = prefix_map.get(element_id, [])
-        suffixes = suffix_map.get(element_id, [])
-        if prefixes or suffixes:
-            original_text = clean_render_text(item.get("text", ""))
-            merged_text = normalize_whitespace(
-                " ".join([*prefixes, original_text, *suffixes])
-            )
-            item["text"] = merged_text
-            item["html"] = ""
-
-        final_elements.append(item)
-
-    direct_drop_count = len(direct_drop_ids)
-    grouped_drop_count = sum(1 for action in grouped_results.values() if action == "drop")
-    context_drop_count = sum(1 for action in context_actions.values() if action == "drop")
-    attached_count = sum(
-        1
-        for action in context_actions.values()
-        if action in {"attach_to_prev", "attach_to_next"}
-    )
-
-    return {
-        "elements": final_elements,
-        "logs": [
-            (
-                "short_text_review:"
-                f"candidates={sum(len(ids) for ids in candidate_groups.values())}:"
-                f"groups={len(candidate_groups)}:"
-                f"direct_drop={direct_drop_count}:"
-                f"group_drop={grouped_drop_count}:"
-                f"context_candidates={len(needs_context_ids)}:"
-                f"context_drop={context_drop_count}:"
-                f"attached={attached_count}:"
-                f"final_drop={len(elements) - len(final_elements)}"
-            )
-        ],
     }
 
 # ---------------------------------------------------------------------------
