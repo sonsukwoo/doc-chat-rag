@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from .llm import DEFAULT_RAW_JSON_PATH
 from .nodes import (
+    build_figure_review_requests,
     build_visual_tasks,
     clean_elements,
     crop_visuals,
@@ -29,42 +30,30 @@ from .nodes import (
     summarize_tables_vlm,
     write_outputs,
 )
-from .state import PreprocessState
-from .utils import collect_neighbor_body_texts
+from .state import (
+    PreprocessInputState,
+    PreprocessOutputState,
+    PreprocessState,
+)
 
 
-def route_figure_reviews(state: PreprocessState) -> Any:
-    """crop된 figure 각각을 독립 worker로 보내 병렬 검토한다."""
-    elements_by_id = {int(element["id"]): element for element in state["elements"]}
-    sends: list[Send] = []
+def route_figure_reviews(
+    state: PreprocessState,
+) -> list[Send] | Literal["prepare_table_summary_inputs"]:
+    """미리 조립된 figure review request를 Send fan-out으로 뿌린다."""
+    requests = state.get("figure_review_requests", [])
+    if not requests:
+        return "prepare_table_summary_inputs"
 
-    for element_id in state.get("figure_review_ids", []):
-        asset = state.get("cropped_assets", {}).get(element_id)
-        element = elements_by_id.get(element_id)
-        if not asset or not element:
-            continue
-        prev_body_text, next_body_text = collect_neighbor_body_texts(
-            state["elements"],
-            element_id,
+    return [
+        Send(
+            "review_single_figure",
+            {
+                "figure_review_request": request,
+            },
         )
-
-        sends.append(
-            Send(
-                "review_single_figure",
-                {
-                    "figure_review_request": {
-                        "element_id": element_id,
-                        "element": element,
-                        "absolute_path": asset["absolute_path"],
-                        "document_profile": state.get("document_profile", {}),
-                        "prev_body_text": prev_body_text,
-                        "next_body_text": next_body_text,
-                    }
-                },
-            )
-        )
-
-    return sends or "prepare_table_summary_inputs"
+        for request in requests
+    ]
 
 
 def route_table_summary_batches(state: PreprocessState) -> Any:
@@ -106,6 +95,7 @@ def _register_nodes(graph: StateGraph) -> None:
     graph.add_node("rule_filter_elements", rule_filter_elements)
     graph.add_node("build_visual_tasks", build_visual_tasks)
     graph.add_node("crop_visuals", crop_visuals)
+    graph.add_node("build_figure_review_requests", build_figure_review_requests)
     graph.add_node("review_single_figure", review_single_figure)
     graph.add_node("prepare_table_summary_inputs", prepare_table_summary_inputs)
     graph.add_node("route_table_summaries", route_table_summaries)
@@ -127,8 +117,9 @@ def _register_edges(graph: StateGraph) -> None:
     graph.add_edge("infer_document_profile", "rule_filter_elements")
     graph.add_edge("rule_filter_elements", "build_visual_tasks")
     graph.add_edge("build_visual_tasks", "crop_visuals")
+    graph.add_edge("crop_visuals", "build_figure_review_requests")
     graph.add_conditional_edges(
-        "crop_visuals",
+        "build_figure_review_requests",
         route_figure_reviews,
         ["review_single_figure", "prepare_table_summary_inputs"],
     )
@@ -150,7 +141,11 @@ def _register_edges(graph: StateGraph) -> None:
 
 def build_graph() -> Any:
     """stage-2 StateGraph를 조립하고 compiled graph를 반환한다."""
-    preprocess_graph = StateGraph(PreprocessState)
+    preprocess_graph = StateGraph(
+        PreprocessState,
+        input_schema=PreprocessInputState,
+        output_schema=PreprocessOutputState,
+    )
     _register_nodes(preprocess_graph)
     _register_edges(preprocess_graph)
     return preprocess_graph.compile()
@@ -174,9 +169,8 @@ agent = _LazyAgent()
 
 def main() -> None:
     """기본 raw.json 입력으로 stage-2 그래프를 한 번 실행한다."""
-    graph_input: PreprocessState = {
+    graph_input: PreprocessInputState = {
         "raw_json_path": str(DEFAULT_RAW_JSON_PATH),
-        "logs": [],
     }
     response = get_agent().invoke(graph_input)
     print(

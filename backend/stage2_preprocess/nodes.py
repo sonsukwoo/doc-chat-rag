@@ -15,11 +15,23 @@ from langchain_core.messages import HumanMessage
 
 from .llm import get_base_model, get_text_model
 from .state import (
+    CroppedAsset,
+    DocumentProfilePayload,
     DocumentProfileResult,
+    ElementPayload,
     FigureReviewResult,
+    FigureReviewPayload,
+    FigureReviewRequest,
+    OutputPaths,
+    OrderingResolutionPayload,
+    PageMetric,
     PreprocessState,
+    TableSummaryInput,
+    TableSummaryPayload,
+    TableSummaryRoute,
     TableSummaryRouteResult,
     TableSummaryResult,
+    VisualTask,
 )
 from .utils import (
     TABLE_LIKE_FIGURE_OVERLAP_THRESHOLD,
@@ -63,7 +75,7 @@ def load_raw_document(state: PreprocessState) -> dict[str, Any]:
     output_dir = raw_json_path.parent.resolve()
 
     with fitz.open(str(source_pdf_path)) as pdf:
-        page_metrics = {
+        page_metrics: dict[int, PageMetric] = {
             page_index + 1: {
                 "width": float(page.rect.width),
                 "height": float(page.rect.height),
@@ -173,7 +185,7 @@ def infer_document_profile(state: PreprocessState) -> dict[str, Any]:
                 HumanMessage(content=prompt),
             ]
         )
-        profile = result.model_dump()
+        profile: DocumentProfilePayload = result.model_dump()
     except Exception as exc:  # pragma: no cover - runtime model dependency
         profile = DocumentProfileResult(
             title=fallback_title,
@@ -228,7 +240,7 @@ def rule_filter_elements(state: PreprocessState) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 def build_visual_tasks(state: PreprocessState) -> dict[str, Any]:
     """Node: crop/VLM 대상 visual만 별도의 작업 목록으로 만든다."""
-    tasks: list[dict[str, Any]] = []
+    tasks: list[VisualTask] = []
     figure_review_ids: list[int] = []
     table_summary_ids: list[int] = []
 
@@ -238,7 +250,7 @@ def build_visual_tasks(state: PreprocessState) -> dict[str, Any]:
         if category not in {"figure", "table"} or not bbox:
             continue
 
-        task = {
+        task: VisualTask = {
             "element_id": int(element["id"]),
             "kind": category,
             "page": int(element["page"]),
@@ -272,7 +284,7 @@ def crop_visuals(state: PreprocessState) -> dict[str, Any]:
     figures_dir = safe_mkdir(output_dir / "figures")
     tables_dir = safe_mkdir(output_dir / "tables")
 
-    cropped_assets: dict[int, dict[str, str]] = {}
+    cropped_assets: dict[int, CroppedAsset] = {}
     counters: dict[tuple[str, int], int] = defaultdict(int)
 
     with fitz.open(str(source_pdf_path)) as pdf:
@@ -320,16 +332,54 @@ def crop_visuals(state: PreprocessState) -> dict[str, Any]:
     }
 
 # ---------------------------------------------------------------------------
+# build_figure_review_requests 노드
+# figure review에 필요한 request payload를 먼저 조립해 상태에 적재한다.
+# ---------------------------------------------------------------------------
+def build_figure_review_requests(state: PreprocessState) -> dict[str, Any]:
+    """Node: figure fan-out worker들이 사용할 request 목록을 만든다."""
+    elements_by_id: dict[int, ElementPayload] = {
+        int(element["id"]): element for element in state["elements"]
+    }
+    document_profile: DocumentProfilePayload = state["document_profile"]
+    requests: list[FigureReviewRequest] = []
+
+    for element_id in state.get("figure_review_ids", []):
+        asset = state.get("cropped_assets", {}).get(element_id)
+        element = elements_by_id.get(element_id)
+        if not asset or not element:
+            continue
+
+        prev_body_text, next_body_text = collect_neighbor_body_texts(
+            state["elements"],
+            element_id,
+        )
+        requests.append(
+            FigureReviewRequest(
+                element_id=element_id,
+                element=element,
+                absolute_path=asset["absolute_path"],
+                document_profile=document_profile,
+                prev_body_text=prev_body_text,
+                next_body_text=next_body_text,
+            )
+        )
+
+    return {
+        "figure_review_requests": requests,
+        "logs": [f"figure_review_requests:{len(requests)}"],
+    }
+
+# ---------------------------------------------------------------------------
 # review_single_figure 노드
 # figure 하나를 멀티모달 모델로 검토해 keep/drop과 summary를 만든다.
 # ---------------------------------------------------------------------------
 def review_single_figure(state: PreprocessState) -> dict[str, Any]:
     """Node: figure 하나를 멀티모달 모델로 검토해 keep/drop + summary를 생성한다."""
-    request = state["figure_review_request"]
+    request: FigureReviewRequest = state["figure_review_request"]
     element_id = int(request["element_id"])
     element = request["element"]
     image_path = Path(request["absolute_path"])
-    document_profile = request.get("document_profile") or {}
+    document_profile: DocumentProfilePayload = request["document_profile"]
     prev_body_text = request.get("prev_body_text") or ""
     next_body_text = request.get("next_body_text") or ""
     reviewer = get_base_model().with_structured_output(FigureReviewResult)
@@ -370,7 +420,7 @@ def review_single_figure(state: PreprocessState) -> dict[str, Any]:
                 ),
             ]
         )
-        payload = result.model_dump()
+        payload: FigureReviewPayload = result.model_dump()
     except Exception as exc:  # pragma: no cover - runtime model dependency
         if is_generic_full_page_figure(element, state.get("page_metrics")):
             payload = FigureReviewResult(action="drop", summary=None).model_dump()
@@ -465,13 +515,13 @@ def _build_table_vlm_summary_prompt(
 def _prepare_table_summary_inputs(
     *,
     table_ids: list[int],
-    elements: list[dict[str, Any]],
-    elements_by_id: dict[int, dict[str, Any]],
-    cropped_assets: dict[int, dict[str, str]],
- ) -> tuple[dict[int, dict[str, Any]], dict[int, str]]:
+    elements: list[ElementPayload],
+    elements_by_id: dict[int, ElementPayload],
+    cropped_assets: dict[int, CroppedAsset],
+) -> tuple[dict[int, TableSummaryInput], dict[int, TableSummaryRoute]]:
     """table summary에 필요한 공통 입력과 기본 route를 미리 만든다."""
-    prepared_inputs: dict[int, dict[str, Any]] = {}
-    seeded_route_results: dict[int, str] = {}
+    prepared_inputs: dict[int, TableSummaryInput] = {}
+    seeded_route_results: dict[int, TableSummaryRoute] = {}
 
     for element_id in table_ids:
         element = elements_by_id.get(element_id)
@@ -506,7 +556,7 @@ def _prepare_table_summary_inputs(
     return prepared_inputs, seeded_route_results
 
 
-def _build_table_summary_fallback(element: dict[str, Any]) -> dict[str, Any]:
+def _build_table_summary_fallback(element: ElementPayload) -> TableSummaryPayload:
     """table summary 생성 실패 시 사용할 최소 fallback payload를 만든다."""
     caption = _extract_element_caption(element)
     fallback = caption or clean_render_text(element.get("text", ""))[:240]
@@ -520,10 +570,10 @@ def _run_text_table_summary_batch(
     text_summarizer: Any,
     text_request_ids: list[int],
     text_requests: list[list[Any]],
-    elements_by_id: dict[int, dict[str, Any]],
-) -> dict[int, dict[str, Any]]:
+    elements_by_id: dict[int, ElementPayload],
+) -> dict[int, TableSummaryPayload]:
     """text 경로 table summary batch를 실행하고 실패 시 fallback으로 대체한다."""
-    summaries: dict[int, dict[str, Any]] = {}
+    summaries: dict[int, TableSummaryPayload] = {}
     if not text_requests:
         return summaries
 
@@ -544,10 +594,10 @@ def _run_vlm_table_summary_batch(
     vlm_summarizer: Any,
     vlm_request_ids: list[int],
     vlm_requests: list[list[Any]],
-    elements_by_id: dict[int, dict[str, Any]],
-) -> dict[int, dict[str, Any]]:
+    elements_by_id: dict[int, ElementPayload],
+) -> dict[int, TableSummaryPayload]:
     """VLM 경로 table summary batch를 실행하고 실패 시 fallback으로 대체한다."""
-    summaries: dict[int, dict[str, Any]] = {}
+    summaries: dict[int, TableSummaryPayload] = {}
     if not vlm_requests:
         return summaries
 
@@ -565,8 +615,8 @@ def _run_vlm_table_summary_batch(
 
 def _resolve_table_route_targets(
     table_ids: list[int],
-    prepared_inputs: dict[int, dict[str, Any]],
-    route_results: dict[int, str],
+    prepared_inputs: dict[int, TableSummaryInput],
+    route_results: dict[int, TableSummaryRoute],
 ) -> tuple[list[int], list[int]]:
     """route 결과를 바탕으로 text/VLM batch 대상 id를 계산한다."""
     text_target_ids: list[int] = []
@@ -596,7 +646,9 @@ def _resolve_table_route_targets(
 # ---------------------------------------------------------------------------
 def prepare_table_summary_inputs(state: PreprocessState) -> dict[str, Any]:
     """Node: table summary용 공통 입력 payload를 만든다."""
-    elements_by_id = {int(element["id"]): element for element in state["elements"]}
+    elements_by_id: dict[int, ElementPayload] = {
+        int(element["id"]): element for element in state["elements"]
+    }
     cropped_assets = state.get("cropped_assets", {})
     table_ids = [int(element_id) for element_id in state.get("table_summary_ids", [])]
     prepared_inputs, seeded_route_results = (
@@ -621,8 +673,10 @@ def prepare_table_summary_inputs(state: PreprocessState) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 def route_table_summaries(state: PreprocessState) -> dict[str, Any]:
     """Node: table별 summary 경로를 text/vlm으로 batch 라우팅한다."""
-    prepared_inputs = state.get("table_summary_inputs", {})
-    seeded_route_results = dict(state.get("table_summary_routes", {}))
+    prepared_inputs: dict[int, TableSummaryInput] = state.get("table_summary_inputs", {})
+    seeded_route_results: dict[int, TableSummaryRoute] = dict(
+        state.get("table_summary_routes", {})
+    )
     profile_text = format_document_profile_for_prompt(state.get("document_profile") or {})
     route_reviewer = get_text_model().with_structured_output(TableSummaryRouteResult)
 
@@ -645,7 +699,7 @@ def route_table_summaries(state: PreprocessState) -> dict[str, Any]:
             ]
         )
 
-    route_results = dict(seeded_route_results)
+    route_results: dict[int, TableSummaryRoute] = dict(seeded_route_results)
     if route_requests:
         try:
             route_batch_results = route_reviewer.batch(route_requests)
@@ -680,10 +734,12 @@ def route_table_summaries(state: PreprocessState) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 def summarize_tables_text(state: PreprocessState) -> dict[str, Any]:
     """Node: text 모델로 처리 가능한 table summary를 batch 생성한다."""
-    prepared_inputs = state.get("table_summary_inputs", {})
-    route_results = state.get("table_summary_routes", {})
+    prepared_inputs: dict[int, TableSummaryInput] = state.get("table_summary_inputs", {})
+    route_results: dict[int, TableSummaryRoute] = state.get("table_summary_routes", {})
     profile_text = format_document_profile_for_prompt(state.get("document_profile") or {})
-    elements_by_id = {int(element["id"]): element for element in state["elements"]}
+    elements_by_id: dict[int, ElementPayload] = {
+        int(element["id"]): element for element in state["elements"]
+    }
     text_summarizer = get_text_model().with_structured_output(TableSummaryResult)
 
     text_request_ids: list[int] = []
@@ -739,10 +795,12 @@ def summarize_tables_text(state: PreprocessState) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 def summarize_tables_vlm(state: PreprocessState) -> dict[str, Any]:
     """Node: VLM이 필요한 table summary를 batch 생성한다."""
-    prepared_inputs = state.get("table_summary_inputs", {})
-    route_results = state.get("table_summary_routes", {})
+    prepared_inputs: dict[int, TableSummaryInput] = state.get("table_summary_inputs", {})
+    route_results: dict[int, TableSummaryRoute] = state.get("table_summary_routes", {})
     profile_text = format_document_profile_for_prompt(state.get("document_profile") or {})
-    elements_by_id = {int(element["id"]): element for element in state["elements"]}
+    elements_by_id: dict[int, ElementPayload] = {
+        int(element["id"]): element for element in state["elements"]
+    }
     vlm_summarizer = get_base_model().with_structured_output(TableSummaryResult)
 
     vlm_request_ids: list[int] = []
@@ -798,9 +856,9 @@ def summarize_tables_vlm(state: PreprocessState) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 def clean_elements(state: PreprocessState) -> dict[str, Any]:
     """Node: VLM 결과 반영, caption dedupe, table-like figure 중복 제거를 수행한다."""
-    figure_reviews = state.get("figure_reviews", {})
-    table_summaries = state.get("table_summaries", {})
-    cropped_assets = state.get("cropped_assets", {})
+    figure_reviews: dict[int, FigureReviewPayload] = state.get("figure_reviews", {})
+    table_summaries: dict[int, TableSummaryPayload] = state.get("table_summaries", {})
+    cropped_assets: dict[int, CroppedAsset] = state.get("cropped_assets", {})
 
     used_caption_refs = set()
     for element in state["elements"]:
@@ -879,11 +937,11 @@ def resolve_visual_order_outliers(state: PreprocessState) -> dict[str, Any]:
     if not cleaned_elements:
         return {
             "cleaned_elements": cleaned_elements,
-            "ordering_resolution": {
-                "applied": False,
-                "adjusted_ids": [],
-                "rank_gap_threshold": 3,
-            },
+            "ordering_resolution": OrderingResolutionPayload(
+                applied=False,
+                adjusted_ids=[],
+                rank_gap_threshold=3,
+            ),
             "logs": ["visual_order_resolved:0"],
         }
 
@@ -897,11 +955,11 @@ def resolve_visual_order_outliers(state: PreprocessState) -> dict[str, Any]:
 
     return {
         "cleaned_elements": resolved_elements,
-        "ordering_resolution": {
-            "applied": bool(adjusted_ids),
-            "adjusted_ids": adjusted_ids,
-            "rank_gap_threshold": 3,
-        },
+        "ordering_resolution": OrderingResolutionPayload(
+            applied=bool(adjusted_ids),
+            adjusted_ids=adjusted_ids,
+            rank_gap_threshold=3,
+        ),
         "logs": [f"visual_order_resolved:{len(adjusted_ids)}"],
     }
 
@@ -1002,11 +1060,13 @@ def write_outputs(state: PreprocessState) -> dict[str, Any]:
     cleaned_md_path = safe_write_text(output_dir / "cleaned.md", state["cleaned_markdown"])
     preview_html_path = safe_write_text(output_dir / "preview.html", state["preview_html"])
 
+    output_paths: OutputPaths = {
+        "cleaned_json": str(cleaned_json_path),
+        "cleaned_md": str(cleaned_md_path),
+        "preview_html": str(preview_html_path),
+    }
+
     return {
-        "output_paths": {
-            "cleaned_json": str(cleaned_json_path),
-            "cleaned_md": str(cleaned_md_path),
-            "preview_html": str(preview_html_path),
-        },
+        "output_paths": output_paths,
         "logs": ["outputs_written"],
     }
