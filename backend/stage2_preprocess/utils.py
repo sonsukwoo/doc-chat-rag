@@ -258,21 +258,6 @@ def image_to_data_url(image_path: Path) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
-def collect_page_context(elements: Sequence[dict[str, Any]], page: int) -> str:
-    """같은 페이지의 텍스트 문맥 일부를 VLM 프롬프트용으로 모은다."""
-    lines: list[str] = []
-    for element in elements:
-        if element.get("page") != page:
-            continue
-        if element.get("category") in {"figure", "table", "page_header", "page_footer"}:
-            continue
-        text = clean_render_text(element.get("text", ""))
-        if not text:
-            continue
-        lines.append(text)
-    return "\n".join(lines[:12])
-
-
 def collect_neighbor_body_texts(
     elements: Sequence[dict[str, Any]],
     target_element_id: int,

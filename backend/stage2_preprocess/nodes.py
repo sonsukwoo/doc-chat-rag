@@ -196,6 +196,8 @@ def infer_document_profile(state: PreprocessState) -> dict[str, Any]:
 
     fallback_title = headings[0] if headings else (body_snippets[0] if body_snippets else "문서")
     fallback_topics = headings[:5] or body_snippets[:5] or ["문서"]
+    used_fallback = False
+    fallback_error_name = ""
 
     try:
         result = profiler.invoke(
@@ -205,6 +207,8 @@ def infer_document_profile(state: PreprocessState) -> dict[str, Any]:
         )
         profile: DocumentProfilePayload = result.model_dump()
     except Exception as exc:  # pragma: no cover - runtime model dependency
+        used_fallback = True
+        fallback_error_name = type(exc).__name__
         profile = DocumentProfileResult(
             title=fallback_title,
             document_type="문서",
@@ -216,12 +220,16 @@ def infer_document_profile(state: PreprocessState) -> dict[str, Any]:
                 "line_chart",
                 "bar_chart",
             ],
-            irrelevant_visual_hints=["광고 배너", "문맥과 무관한 홍보 이미지", f"fallback:{exc}"],
+            irrelevant_visual_hints=["광고 배너", "문맥과 무관한 홍보 이미지"],
         ).model_dump()
+
+    log_message = f"document_profile:{profile.get('document_type', 'unknown')}"
+    if used_fallback:
+        log_message += f":fallback={fallback_error_name}"
 
     return {
         "document_profile": profile,
-        "logs": [f"document_profile:{profile.get('document_type', 'unknown')}"],
+        "logs": [log_message],
     }
 
 # ---------------------------------------------------------------------------
@@ -239,9 +247,7 @@ def rule_filter_elements(state: PreprocessState) -> dict[str, Any]:
         category = item.get("category")
 
         if category == "figure":
-            drop_reason = is_obvious_junk_figure(item, page_metrics)
-            if drop_reason:
-                item["drop_reason"] = drop_reason
+            if is_obvious_junk_figure(item, page_metrics):
                 dropped += 1
                 continue
 
@@ -514,6 +520,26 @@ def _build_table_text_summary_prompt(
         f"- document profile:\n{profile_text}\n\n"
         f"- caption: {caption or '없음'}\n"
         f"- table html:\n{source_block}"
+    )
+
+
+def _build_table_context_fallback_prompt(
+    *,
+    profile_text: str,
+    caption: str,
+    text_excerpt: str,
+    local_context_block: str,
+) -> str:
+    """이미지 없이 caption/text/context만으로 요약할 때 쓸 fallback prompt를 만든다."""
+    return (
+        "이미지가 없으므로 아래 caption, table text, local body context만 참고해 "
+        "RAG 검색에 도움이 되도록 핵심만 짧게 한국어로 요약하라. "
+        "표 구조를 복원하려 하지 말고, 제목·핵심 주제·비교 대상이 드러나면 이를 반영하라. "
+        "보이지 않는 내용은 추측하지 말라.\n\n"
+        f"- document profile:\n{profile_text}\n\n"
+        f"- caption: {caption or '없음'}\n"
+        f"- table text:\n{text_excerpt or '(없음)'}\n"
+        f"- local body context:\n{local_context_block}"
     )
 
 
@@ -804,9 +830,10 @@ def summarize_tables_text(
                 source_block=source_block,
             )
         else:
-            prompt = _build_table_vlm_summary_prompt(
+            prompt = _build_table_context_fallback_prompt(
                 profile_text=profile_text,
                 caption=caption,
+                text_excerpt=text_excerpt,
                 local_context_block=local_context_block,
             )
 
