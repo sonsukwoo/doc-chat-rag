@@ -57,6 +57,27 @@ def clean_render_text(text: str) -> str:
     return normalize_whitespace(cleaned)
 
 
+def strip_duplicate_leading_caption(body_text: str, caption: str) -> str:
+    """본문 선두에 caption이 그대로 반복되면 한 번 제거한다."""
+    normalized_body = (body_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized_caption = clean_render_text(caption)
+    if not normalized_body or not normalized_caption:
+        return normalized_body
+
+    body_lines = normalized_body.splitlines()
+    while body_lines and not body_lines[0].strip():
+        body_lines.pop(0)
+    if not body_lines:
+        return ""
+
+    first_line = clean_render_text(body_lines[0])
+    if first_line != normalized_caption:
+        return normalized_body
+
+    deduped = "\n".join(body_lines[1:]).strip()
+    return deduped
+
+
 def format_document_profile_for_prompt(profile: dict[str, Any]) -> str:
     """document_profile을 프롬프트용 짧은 문자열로 압축한다."""
     if not profile:
@@ -515,7 +536,10 @@ def render_table_markdown(element: dict[str, Any]) -> str:
     caption = clean_render_text(
         element.get("resolved_caption") or element.get("internal_caption_text") or ""
     )
-    table_markdown = (element.get("table") or {}).get("markdown") or ""
+    table_markdown = strip_duplicate_leading_caption(
+        (element.get("table") or {}).get("markdown") or "",
+        caption,
+    )
     summary = clean_render_text(element.get("table_summary", ""))
 
     blocks: list[str] = []
@@ -575,7 +599,8 @@ def render_table_html(element: dict[str, Any]) -> str:
     image_path = element.get("image_path")
 
     parts = ["<section class=\"table-block\">"]
-    if caption:
+    html_has_caption = bool(re.search(r"<caption\b", table_html, flags=re.IGNORECASE))
+    if caption and not html_has_caption:
         parts.append(f"<p><strong>{escape(caption)}</strong></p>")
     if table_html:
         parts.append(table_html)

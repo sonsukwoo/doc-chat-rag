@@ -1,4 +1,4 @@
-"""Semantic chunking에서 재사용하는 embedding helper."""
+"""Stage-3에서 공통으로 재사용하는 OpenAI 호환 embedding helper."""
 
 from __future__ import annotations
 
@@ -29,13 +29,13 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
-class SemanticEmbeddingClient:
+class OpenAIEmbeddingClient:
     """OpenAI 호환 embeddings API를 감싼 best-effort client."""
 
     def __init__(
         self,
         *,
-        enabled: bool = STAGE3_ENABLE_SEMANTIC,
+        enabled: bool = True,
         base_url: str = STAGE3_EMBEDDING_BASE_URL,
         api_key: str = STAGE3_EMBEDDING_API_KEY,
         model: str = STAGE3_EMBEDDING_MODEL,
@@ -85,3 +85,24 @@ class SemanticEmbeddingClient:
                 return None
             embeddings.append(cached)
         return embeddings
+
+
+class SemanticEmbeddingClient(OpenAIEmbeddingClient):
+    """semantic split/merge 기본 설정을 입힌 embedding client."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = STAGE3_ENABLE_SEMANTIC,
+        base_url: str = STAGE3_EMBEDDING_BASE_URL,
+        api_key: str = STAGE3_EMBEDDING_API_KEY,
+        model: str = STAGE3_EMBEDDING_MODEL,
+        batch_size: int = STAGE3_EMBEDDING_BATCH_SIZE,
+    ) -> None:
+        super().__init__(
+            enabled=enabled,
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            batch_size=batch_size,
+        )

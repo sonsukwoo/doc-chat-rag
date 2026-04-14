@@ -5,10 +5,16 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = PACKAGE_DIR.parent
+PROJECT_ROOT = BACKEND_DIR.parent
+ENV_PATH = PROJECT_ROOT / ".env"
 OUTPUT_ROOT = BACKEND_DIR / "outputs"
+
+load_dotenv(ENV_PATH)
 
 
 def _read_bool(name: str, default: bool) -> bool:

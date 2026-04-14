@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from backend.stage3_chunking.pipeline import run_stage3_chunking
+from backend.stage2_preprocess.utils import render_table_markdown
 
 
 class _DisabledEmbeddingClient:
@@ -16,6 +17,39 @@ class _DisabledEmbeddingClient:
 
 
 class Stage3ChunkingTests(unittest.TestCase):
+    def test_duplicate_table_caption_is_deduped(self):
+        table_element = {
+            "id": 1,
+            "category": "table",
+            "page": 7,
+            "order": 1,
+            "resolved_caption": "Table 4. One-shot example for generating disease descriptions",
+            "table_summary": "질병 설명 생성을 위한 원샷 예시 제공.",
+            "table": {
+                "markdown": (
+                    "Table 4. One-shot example for generating disease descriptions\n\n"
+                    "| Korean Original Example | English-Translated Example |\n"
+                    "|---|---|\n"
+                    "| 예시 | Example |"
+                )
+            },
+            "html": (
+                "<table><caption><div class=\"caption\">"
+                "Table 4. One-shot example for generating disease descriptions"
+                "</div></caption><tbody><tr><td>예시</td></tr></tbody></table>"
+            ),
+            "text": (
+                "Table 4. One-shot example for generating disease descriptions | "
+                "Korean Original Example | English-Translated Example |"
+            ),
+        }
+
+        markdown = render_table_markdown(table_element)
+        self.assertEqual(
+            markdown.count("Table 4. One-shot example for generating disease descriptions"),
+            1,
+        )
+
     def test_run_stage3_chunking_smoke(self):
         sample_payload = {
             "source_pdf": "/tmp/sample.pdf",
@@ -115,6 +149,7 @@ class Stage3ChunkingTests(unittest.TestCase):
             self.assertIn("Table 1. 예시 표", table_chunk["text"])
             self.assertIn("예시 표 요약", table_chunk["text"])
             self.assertNotIn("캡션:", table_chunk["text"])
+            self.assertEqual(table_chunk["text"].count("Table 1. 예시 표"), 1)
 
             figure_chunk = next(
                 chunk for chunk in chunks if chunk["chunk_type"] == "figure"

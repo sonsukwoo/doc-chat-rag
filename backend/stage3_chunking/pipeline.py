@@ -226,15 +226,39 @@ def _extract_visual_caption(element: dict[str, Any]) -> str:
     return fallback_text
 
 
+def _strip_duplicate_leading_caption(body_text: str, caption: str) -> str:
+    """table body 선두에 caption이 그대로 반복되면 한 번 제거한다."""
+    normalized_body = _normalize_text(body_text)
+    normalized_caption = _normalize_text(caption)
+    if not normalized_body or not normalized_caption:
+        return normalized_body
+
+    body_lines = normalized_body.splitlines()
+    while body_lines and not body_lines[0].strip():
+        body_lines.pop(0)
+    if not body_lines:
+        return ""
+
+    first_line = _normalize_text(body_lines[0])
+    if first_line != normalized_caption:
+        return normalized_body
+
+    return "\n".join(body_lines[1:]).strip()
+
+
 def _extract_table_body(element: dict[str, Any]) -> str:
+    caption = _extract_visual_caption(element)
     table_payload = element.get("table") or {}
     markdown = _normalize_text(table_payload.get("markdown"))
     if markdown:
-        return markdown
+        return _strip_duplicate_leading_caption(markdown, caption)
     html_excerpt = _normalize_text(element.get("html"))
     if html_excerpt:
         return html_excerpt
-    return _normalize_text(element.get("text"))
+    return _strip_duplicate_leading_caption(
+        _normalize_text(element.get("text")),
+        caption,
+    )
 
 
 def _extract_figure_summary(element: dict[str, Any]) -> str:
