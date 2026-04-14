@@ -53,11 +53,11 @@ class DocumentProfileResult(BaseModel):
     )
 
 
-def merge_review_maps(
+def merge_result_maps(
     current: Optional[dict[int, dict[str, Any]]],
     update: Optional[dict[int, dict[str, Any]]],
 ) -> dict[int, dict[str, Any]]:
-    """fan-out worker가 반환한 figure review dict를 하나로 합친다."""
+    """병렬 노드가 반환한 id 기반 dict 결과를 하나로 합친다."""
     return {**(current or {}), **(update or {})}
 
 
@@ -75,9 +75,11 @@ class PreprocessState(TypedDict, total=False):
     figure_review_ids: list[int]  # VLM 검토가 필요한 figure element id 목록
     table_summary_ids: list[int]  # summary 생성이 필요한 table element id 목록
     cropped_assets: dict[int, dict[str, str]]  # element id별 crop 이미지 상대/절대 경로
+    table_summary_inputs: dict[int, dict[str, Any]]  # table summary를 위한 중간 입력 payload
+    table_summary_routes: dict[int, str]  # table id별 text/vlm 라우팅 결과
     figure_review_request: dict[str, Any]  # fan-out worker가 개별 figure 검토에 쓰는 입력 payload
-    figure_reviews: Annotated[dict[int, dict[str, Any]], merge_review_maps]  # figure id별 keep/drop + summary 결과
-    table_summaries: dict[int, dict[str, Any]]  # table id별 summary 결과
+    figure_reviews: Annotated[dict[int, dict[str, Any]], merge_result_maps]  # figure id별 keep/drop + summary 결과
+    table_summaries: Annotated[dict[int, dict[str, Any]], merge_result_maps]  # table id별 summary 결과
     cleaned_elements: list[dict[str, Any]]  # 최종 keep/drop 반영 후 정리된 element 목록
     ordering_resolution: dict[str, Any]  # bbox 순서 보정 적용 여부와 조정된 element id 목록
     cleaned_markdown: str  # 최종 Markdown 문자열

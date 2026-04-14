@@ -386,46 +386,110 @@ def review_single_figure(state: PreprocessState) -> dict[str, Any]:
     }
 
 # ---------------------------------------------------------------------------
-# summarize_tables 노드
-# table crop와 현재 markdown을 바탕으로 표 summary를 batch 생성한다.
+# table summary 공통 helper
+# 단계별 노드에서 공통으로 재사용하는 prompt / fallback / batch helper를 둔다.
 # ---------------------------------------------------------------------------
-def summarize_tables(state: PreprocessState) -> dict[str, Any]:
-    """Node: table을 html 기반 text summary 또는 image VLM summary로 라우팅해 생성한다."""
-    elements_by_id = {int(element["id"]): element for element in state["elements"]}
-    cropped_assets = state.get("cropped_assets", {})
-    document_profile = state.get("document_profile") or {}
-    table_summaries: dict[int, dict[str, Any]] = {}
-    profile_text = format_document_profile_for_prompt(document_profile)
-    route_reviewer = get_text_model().with_structured_output(TableSummaryRouteResult)
-    text_summarizer = get_text_model().with_structured_output(TableSummaryResult)
-    vlm_summarizer = get_base_model().with_structured_output(TableSummaryResult)
+def _extract_element_caption(element: dict[str, Any]) -> str:
+    """figure/table 공통 caption 후보를 하나의 문자열로 정리한다."""
+    return clean_render_text(
+        element.get("resolved_caption") or element.get("internal_caption_text") or ""
+    )
 
+
+def _build_local_body_context_block(
+    *,
+    prev_body_text: str,
+    next_body_text: str,
+) -> str:
+    """앞뒤 본문 힌트를 prompt용 문자열로 정리한다."""
+    local_context_lines: list[str] = []
+    if prev_body_text:
+        local_context_lines.append(f"- previous body text: {prev_body_text}")
+    if next_body_text:
+        local_context_lines.append(f"- next body text: {next_body_text}")
+    return "\n".join(local_context_lines) or "- 없음"
+
+
+def _build_table_route_prompt(
+    *,
+    profile_text: str,
+    caption: str,
+    html_excerpt: str,
+) -> str:
+    """table html만으로 요약 가능한지 판단하는 라우팅 prompt를 만든다."""
+    return (
+        "아래 table HTML만 보고, 이미지를 보지 않아도 이 표를 한국어로 요약할 수 있는지 판단하라. "
+        "열 이름, 행 이름, 값 구조가 HTML에 충분히 드러나면 text, "
+        "구조가 깨져 있거나 의미 파악이 어려워 이미지 확인이 필요하면 vlm을 반환하라.\n\n"
+        f"- document profile:\n{profile_text}\n\n"
+        f"- caption: {caption or '없음'}\n"
+        f"- table html:\n{html_excerpt}"
+    )
+
+
+def _build_table_text_summary_prompt(
+    *,
+    profile_text: str,
+    caption: str,
+    source_block: str,
+) -> str:
+    """text 모델용 table summary prompt를 만든다."""
+    return (
+        "아래 table HTML을 보고 RAG 검색에 도움이 되도록 핵심만 짧게 한국어로 요약하라. "
+        "표 구조를 복원하려 하지 말고, 제목·열 이름·행 이름·핵심 값 관계가 드러나면 이를 반영하라. "
+        "보이지 않는 내용은 추측하지 말라.\n\n"
+        f"- document profile:\n{profile_text}\n\n"
+        f"- caption: {caption or '없음'}\n"
+        f"- table html:\n{source_block}"
+    )
+
+
+def _build_table_vlm_summary_prompt(
+    *,
+    profile_text: str,
+    caption: str,
+    local_context_block: str,
+) -> str:
+    """VLM용 table summary prompt를 만든다."""
+    return (
+        "표의 구조를 복원하지 말고, 이미지를 보고 RAG 검색에 도움이 되도록 핵심만 짧게 한국어로 요약하라. "
+        "판단할 때는 아래 document profile에 담긴 문서 주제와 핵심 토픽을 우선 참고하라. "
+        "아래 local body context는 표 주변의 본문 텍스트로, 보조 힌트로만 참고하라. "
+        "표 안의 식별 가능한 제목, 열 이름, 비교 축, 주요 수치는 요약에 반영하고, 보이지 않는 내용은 추측하지 말라.\n\n"
+        f"- document profile:\n{profile_text}\n\n"
+        f"- caption: {caption or '없음'}\n"
+        f"- local body context:\n{local_context_block}"
+    )
+
+
+def _prepare_table_summary_inputs(
+    *,
+    table_ids: list[int],
+    elements: list[dict[str, Any]],
+    elements_by_id: dict[int, dict[str, Any]],
+    cropped_assets: dict[int, dict[str, str]],
+ ) -> tuple[dict[int, dict[str, Any]], dict[int, str]]:
+    """table summary에 필요한 공통 입력과 기본 route를 미리 만든다."""
     prepared_inputs: dict[int, dict[str, Any]] = {}
-    route_requests: list[list[Any]] = []
-    route_request_ids: list[int] = []
-    route_results: dict[int, str] = {}
+    seeded_route_results: dict[int, str] = {}
 
-    for element_id in state.get("table_summary_ids", []):
+    for element_id in table_ids:
         element = elements_by_id.get(element_id)
         if not element:
             continue
 
         asset = cropped_assets.get(element_id)
-        caption = clean_render_text(
-            element.get("resolved_caption") or element.get("internal_caption_text") or ""
-        )
+        caption = _extract_element_caption(element)
         html_excerpt = compact_html_for_prompt(element.get("html", ""))
         text_excerpt = clean_render_text(element.get("text", ""))[:800]
         prev_body_text, next_body_text = collect_neighbor_body_texts(
-            state["elements"],
+            elements,
             element_id,
         )
-        local_context_lines: list[str] = []
-        if prev_body_text:
-            local_context_lines.append(f"- previous body text: {prev_body_text}")
-        if next_body_text:
-            local_context_lines.append(f"- next body text: {next_body_text}")
-        local_context_block = "\n".join(local_context_lines) or "- 없음"
+        local_context_block = _build_local_body_context_block(
+            prev_body_text=prev_body_text,
+            next_body_text=next_body_text,
+        )
 
         prepared_inputs[element_id] = {
             "asset": asset,
@@ -435,21 +499,153 @@ def summarize_tables(state: PreprocessState) -> dict[str, Any]:
             "local_context_block": local_context_block,
         }
 
+        # html이 없으면 image 유무만으로 기본 경로를 결정한다.
         if not html_excerpt:
-            route_results[element_id] = "vlm" if asset else "text"
+            seeded_route_results[element_id] = "vlm" if asset else "text"
+            continue
+    return prepared_inputs, seeded_route_results
+
+
+def _build_table_summary_fallback(element: dict[str, Any]) -> dict[str, Any]:
+    """table summary 생성 실패 시 사용할 최소 fallback payload를 만든다."""
+    caption = _extract_element_caption(element)
+    fallback = caption or clean_render_text(element.get("text", ""))[:240]
+    return TableSummaryResult(
+        summary=fallback or "표 요약 생성 실패",
+    ).model_dump()
+
+
+def _run_text_table_summary_batch(
+    *,
+    text_summarizer: Any,
+    text_request_ids: list[int],
+    text_requests: list[list[Any]],
+    elements_by_id: dict[int, dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    """text 경로 table summary batch를 실행하고 실패 시 fallback으로 대체한다."""
+    summaries: dict[int, dict[str, Any]] = {}
+    if not text_requests:
+        return summaries
+
+    try:
+        text_results = text_summarizer.batch(text_requests)
+        for element_id, result in zip(text_request_ids, text_results, strict=False):
+            summaries[element_id] = result.model_dump()
+    except Exception:
+        for element_id in text_request_ids:
+            element = elements_by_id[element_id]
+            summaries[element_id] = _build_table_summary_fallback(element)
+
+    return summaries
+
+
+def _run_vlm_table_summary_batch(
+    *,
+    vlm_summarizer: Any,
+    vlm_request_ids: list[int],
+    vlm_requests: list[list[Any]],
+    elements_by_id: dict[int, dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    """VLM 경로 table summary batch를 실행하고 실패 시 fallback으로 대체한다."""
+    summaries: dict[int, dict[str, Any]] = {}
+    if not vlm_requests:
+        return summaries
+
+    try:
+        vlm_results = vlm_summarizer.batch(vlm_requests)
+        for element_id, result in zip(vlm_request_ids, vlm_results, strict=False):
+            summaries[element_id] = result.model_dump()
+    except Exception:
+        for element_id in vlm_request_ids:
+            element = elements_by_id[element_id]
+            summaries[element_id] = _build_table_summary_fallback(element)
+
+    return summaries
+
+
+def _resolve_table_route_targets(
+    table_ids: list[int],
+    prepared_inputs: dict[int, dict[str, Any]],
+    route_results: dict[int, str],
+) -> tuple[list[int], list[int]]:
+    """route 결과를 바탕으로 text/VLM batch 대상 id를 계산한다."""
+    text_target_ids: list[int] = []
+    vlm_target_ids: list[int] = []
+
+    for element_id in table_ids:
+        prepared = prepared_inputs.get(element_id)
+        if not prepared:
             continue
 
-        route_prompt = (
-            "아래 table HTML만 보고, 이미지를 보지 않아도 이 표를 한국어로 요약할 수 있는지 판단하라. "
-            "열 이름, 행 이름, 값 구조가 HTML에 충분히 드러나면 text, "
-            "구조가 깨져 있거나 의미 파악이 어려워 이미지 확인이 필요하면 vlm을 반환하라.\n\n"
-            f"- document profile:\n{profile_text}\n\n"
-            f"- caption: {caption or '없음'}\n"
-            f"- table html:\n{html_excerpt}"
-        )
-        route_request_ids.append(element_id)
-        route_requests.append([HumanMessage(content=route_prompt)])
+        asset = prepared.get("asset")
+        route = route_results.get(element_id, "vlm" if asset else "text")
 
+        # image가 없으면 vlm 경로여도 text 모델로 fallback 처리한다.
+        if route == "vlm" and asset:
+            vlm_target_ids.append(element_id)
+            continue
+
+        text_target_ids.append(element_id)
+
+    return text_target_ids, vlm_target_ids
+
+
+# ---------------------------------------------------------------------------
+# prepare_table_summary_inputs 노드
+# table summary에 필요한 공통 입력과 기본 route를 상태에 적재한다.
+# ---------------------------------------------------------------------------
+def prepare_table_summary_inputs(state: PreprocessState) -> dict[str, Any]:
+    """Node: table summary용 공통 입력 payload를 만든다."""
+    elements_by_id = {int(element["id"]): element for element in state["elements"]}
+    cropped_assets = state.get("cropped_assets", {})
+    table_ids = [int(element_id) for element_id in state.get("table_summary_ids", [])]
+    prepared_inputs, seeded_route_results = (
+        _prepare_table_summary_inputs(
+            table_ids=table_ids,
+            elements=state["elements"],
+            elements_by_id=elements_by_id,
+            cropped_assets=cropped_assets,
+        )
+    )
+
+    return {
+        "table_summary_inputs": prepared_inputs,
+        "table_summary_routes": seeded_route_results,
+        "logs": [f"table_summary_inputs:{len(prepared_inputs)}"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# route_table_summaries 노드
+# table별로 text/vlm 어느 경로로 summary를 만들지 batch 라우팅한다.
+# ---------------------------------------------------------------------------
+def route_table_summaries(state: PreprocessState) -> dict[str, Any]:
+    """Node: table별 summary 경로를 text/vlm으로 batch 라우팅한다."""
+    prepared_inputs = state.get("table_summary_inputs", {})
+    seeded_route_results = dict(state.get("table_summary_routes", {}))
+    profile_text = format_document_profile_for_prompt(state.get("document_profile") or {})
+    route_reviewer = get_text_model().with_structured_output(TableSummaryRouteResult)
+
+    route_request_ids: list[int] = []
+    route_requests: list[list[Any]] = []
+    for element_id, prepared in prepared_inputs.items():
+        if element_id in seeded_route_results:
+            continue
+
+        route_request_ids.append(element_id)
+        route_requests.append(
+            [
+                HumanMessage(
+                    content=_build_table_route_prompt(
+                        profile_text=profile_text,
+                        caption=prepared["caption"],
+                        html_excerpt=prepared["html_excerpt"],
+                    )
+                )
+            ]
+        )
+
+    route_results = dict(seeded_route_results)
     if route_requests:
         try:
             route_batch_results = route_reviewer.batch(route_requests)
@@ -460,12 +656,39 @@ def summarize_tables(state: PreprocessState) -> dict[str, Any]:
                 asset = prepared_inputs[element_id].get("asset")
                 route_results[element_id] = "vlm" if asset else "text"
 
-    text_requests: list[list[Any]] = []
-    text_request_ids: list[int] = []
-    vlm_requests: list[list[Any]] = []
-    vlm_request_ids: list[int] = []
+    text_target_ids, vlm_target_ids = _resolve_table_route_targets(
+        table_ids=[int(element_id) for element_id in state.get("table_summary_ids", [])],
+        prepared_inputs=prepared_inputs,
+        route_results=route_results,
+    )
 
-    for element_id in state.get("table_summary_ids", []):
+    return {
+        "table_summary_routes": route_results,
+        "logs": [
+            (
+                "table_routes:"
+                f"text={len(text_target_ids)}:"
+                f"vlm={len(vlm_target_ids)}"
+            )
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# summarize_tables_text 노드
+# text 경로 table들과 asset이 없는 vlm fallback table들을 text batch로 요약한다.
+# ---------------------------------------------------------------------------
+def summarize_tables_text(state: PreprocessState) -> dict[str, Any]:
+    """Node: text 모델로 처리 가능한 table summary를 batch 생성한다."""
+    prepared_inputs = state.get("table_summary_inputs", {})
+    route_results = state.get("table_summary_routes", {})
+    profile_text = format_document_profile_for_prompt(state.get("document_profile") or {})
+    elements_by_id = {int(element["id"]): element for element in state["elements"]}
+    text_summarizer = get_text_model().with_structured_output(TableSummaryResult)
+
+    text_request_ids: list[int] = []
+    text_requests: list[list[Any]] = []
+    for element_id in [int(item) for item in state.get("table_summary_ids", [])]:
         prepared = prepared_inputs.get(element_id)
         if not prepared:
             continue
@@ -477,96 +700,96 @@ def summarize_tables(state: PreprocessState) -> dict[str, Any]:
         asset = prepared["asset"]
         route = route_results.get(element_id, "vlm" if asset else "text")
 
-        if route == "text":
-            source_block = html_excerpt or text_excerpt or "(없음)"
-            text_prompt = (
-                "아래 table HTML을 보고 RAG 검색에 도움이 되도록 핵심만 짧게 한국어로 요약하라. "
-                "표 구조를 복원하려 하지 말고, 제목·열 이름·행 이름·핵심 값 관계가 드러나면 이를 반영하라. "
-                "보이지 않는 내용은 추측하지 말라.\n\n"
-                f"- document profile:\n{profile_text}\n\n"
-                f"- caption: {caption or '없음'}\n"
-                f"- table html:\n{source_block}"
-            )
-            text_request_ids.append(element_id)
-            text_requests.append([HumanMessage(content=text_prompt)])
+        if route == "vlm" and asset:
             continue
 
-        vlm_prompt = (
-            "표의 구조를 복원하지 말고, 이미지를 보고 RAG 검색에 도움이 되도록 핵심만 짧게 한국어로 요약하라. "
-            "판단할 때는 아래 document profile에 담긴 문서 주제와 핵심 토픽을 우선 참고하라. "
-            "아래 local body context는 표 주변의 본문 텍스트로, 보조 힌트로만 참고하라. "
-            "표 안의 식별 가능한 제목, 열 이름, 비교 축, 주요 수치는 요약에 반영하고, 보이지 않는 내용은 추측하지 말라.\n\n"
-            f"- document profile:\n{profile_text}\n\n"
-            f"- caption: {caption or '없음'}\n"
-            f"- local body context:\n{local_context_block}"
-        )
-        if asset:
-            vlm_request_ids.append(element_id)
-            vlm_requests.append(
-                [
-                    HumanMessage(
-                        content=[
-                            {"type": "text", "text": vlm_prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": image_to_data_url(Path(asset["absolute_path"]))},
-                            },
-                        ]
-                    ),
-                ]
+        if route == "text":
+            source_block = html_excerpt or text_excerpt or "(없음)"
+            prompt = _build_table_text_summary_prompt(
+                profile_text=profile_text,
+                caption=caption,
+                source_block=source_block,
             )
         else:
-            text_request_ids.append(element_id)
-            text_requests.append([HumanMessage(content=vlm_prompt)])
+            prompt = _build_table_vlm_summary_prompt(
+                profile_text=profile_text,
+                caption=caption,
+                local_context_block=local_context_block,
+            )
 
-    if not text_requests and not vlm_requests:
-        return {
-            "table_summaries": table_summaries,
-            "logs": ["table_summaries:0"],
-        }
+        text_request_ids.append(element_id)
+        text_requests.append([HumanMessage(content=prompt)])
 
-    if text_requests:
-        try:
-            text_results = text_summarizer.batch(text_requests)
-            for element_id, result in zip(text_request_ids, text_results, strict=False):
-                table_summaries[element_id] = result.model_dump()
-        except Exception:
-            for element_id in text_request_ids:
-                element = elements_by_id[element_id]
-                caption = clean_render_text(
-                    element.get("resolved_caption") or element.get("internal_caption_text") or ""
-                )
-                fallback = caption or clean_render_text(element.get("text", ""))[:240]
-                table_summaries[element_id] = TableSummaryResult(
-                    summary=fallback or "표 요약 생성 실패",
-                ).model_dump()
-
-    if vlm_requests:
-        try:
-            vlm_results = vlm_summarizer.batch(vlm_requests)
-            for element_id, result in zip(vlm_request_ids, vlm_results, strict=False):
-                table_summaries[element_id] = result.model_dump()
-        except Exception:
-            for element_id in vlm_request_ids:
-                element = elements_by_id[element_id]
-                caption = clean_render_text(
-                    element.get("resolved_caption") or element.get("internal_caption_text") or ""
-                )
-                fallback = caption or clean_render_text(element.get("text", ""))[:240]
-                table_summaries[element_id] = TableSummaryResult(
-                    summary=fallback or "표 요약 생성 실패",
-                ).model_dump()
+    table_summaries = _run_text_table_summary_batch(
+        text_summarizer=text_summarizer,
+        text_request_ids=text_request_ids,
+        text_requests=text_requests,
+        elements_by_id=elements_by_id,
+    )
 
     return {
         "table_summaries": table_summaries,
-        "logs": [
-            (
-                "table_summaries:"
-                f"{len(table_summaries)}:"
-                f"text={len(text_request_ids)}:"
-                f"vlm={len(vlm_request_ids)}"
-            )
-        ],
+        "logs": [f"table_summaries_text:{len(table_summaries)}"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# summarize_tables_vlm 노드
+# image가 필요한 table들을 VLM batch로 요약한다.
+# ---------------------------------------------------------------------------
+def summarize_tables_vlm(state: PreprocessState) -> dict[str, Any]:
+    """Node: VLM이 필요한 table summary를 batch 생성한다."""
+    prepared_inputs = state.get("table_summary_inputs", {})
+    route_results = state.get("table_summary_routes", {})
+    profile_text = format_document_profile_for_prompt(state.get("document_profile") or {})
+    elements_by_id = {int(element["id"]): element for element in state["elements"]}
+    vlm_summarizer = get_base_model().with_structured_output(TableSummaryResult)
+
+    vlm_request_ids: list[int] = []
+    vlm_requests: list[list[Any]] = []
+    for element_id in [int(item) for item in state.get("table_summary_ids", [])]:
+        prepared = prepared_inputs.get(element_id)
+        if not prepared:
+            continue
+
+        asset = prepared["asset"]
+        if not asset:
+            continue
+
+        route = route_results.get(element_id, "vlm")
+        if route != "vlm":
+            continue
+
+        prompt = _build_table_vlm_summary_prompt(
+            profile_text=profile_text,
+            caption=prepared["caption"],
+            local_context_block=prepared["local_context_block"],
+        )
+        vlm_request_ids.append(element_id)
+        vlm_requests.append(
+            [
+                HumanMessage(
+                    content=[
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_to_data_url(Path(asset["absolute_path"]))},
+                        },
+                    ]
+                ),
+            ]
+        )
+
+    table_summaries = _run_vlm_table_summary_batch(
+        vlm_summarizer=vlm_summarizer,
+        vlm_request_ids=vlm_request_ids,
+        vlm_requests=vlm_requests,
+        elements_by_id=elements_by_id,
+    )
+
+    return {
+        "table_summaries": table_summaries,
+        "logs": [f"table_summaries_vlm:{len(table_summaries)}"],
     }
 
 # ---------------------------------------------------------------------------
