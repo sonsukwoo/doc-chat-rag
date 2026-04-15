@@ -13,19 +13,17 @@ from .config import (
     DEFAULT_CHUNKS_JSON_NAME,
     DEFAULT_CHUNKS_JSONL_NAME,
     DEFAULT_CLEANED_JSON_PATH,
-    STAGE3_ENABLE_SEMANTIC_MERGE,
-    STAGE3_ENABLE_SEMANTIC_SPLIT,
-    STAGE3_SEMANTIC_MERGE_CANDIDATE_MAX_TOKENS,
-    STAGE3_SEMANTIC_MERGE_SIM_THRESHOLD,
-    STAGE3_SEMANTIC_SPLIT_SIM_THRESHOLD,
+    DEFAULT_PARENTS_JSON_NAME,
+    STAGE3_PARENT_MAX_TOKENS,
     STAGE3_TEXT_MAX_TOKENS,
     STAGE3_TEXT_MIN_TOKENS,
     STAGE3_TEXT_OVERLAP_TOKENS,
     STAGE3_TEXT_TARGET_TOKENS,
 )
-from .embeddings import SemanticEmbeddingClient, cosine_similarity
+from .embeddings import SemanticEmbeddingClient
 from .schemas import (
     ChunkPayload,
+    ParentPayload,
     ChunkSourceElement,
     Stage3ChunkStats,
     Stage3Input,
@@ -108,6 +106,7 @@ def build_stage3_output_paths(
         "chunks_json": str((resolved_output_dir / DEFAULT_CHUNKS_JSON_NAME).resolve()),
         "chunks_jsonl": str((resolved_output_dir / DEFAULT_CHUNKS_JSONL_NAME).resolve()),
         "chunks_md": str((resolved_output_dir / DEFAULT_CHUNKS_MD_NAME).resolve()),
+        "parents_json": str((resolved_output_dir / DEFAULT_PARENTS_JSON_NAME).resolve()),
     }
 
 
@@ -129,6 +128,14 @@ def _estimate_tokens(text: str) -> int:
     word_units = len(re.findall(r"\S+", normalized))
     char_units = len(re.sub(r"\s+", "", normalized))
     return max(word_units, max(1, char_units // 4))
+
+
+def _build_section_title_from_heading_path(heading_path: Iterable[str]) -> str | None:
+    """heading_path를 사람이 읽기 쉬운 단일 섹션 문자열로 평탄화한다."""
+    normalized = [str(item).strip() for item in heading_path if str(item).strip()]
+    if not normalized:
+        return None
+    return " > ".join(normalized)
 
 
 def _unique_ints(values: Iterable[int]) -> list[int]:
@@ -330,7 +337,7 @@ def _build_text_chunk_from_segments(
     *,
     parent: ChunkDraft,
     segments: list[TextSegment],
-    semantic_split_applied: bool,
+    hard_split_applied: bool,
 ) -> ChunkDraft:
     group_type = str(parent.metadata.get("group_type") or "prose")
     source_elements = _unique_source_elements(
@@ -343,7 +350,9 @@ def _build_text_chunk_from_segments(
         element_id for segment in segments for element_id in segment.element_ids
     )
     metadata = dict(parent.metadata)
-    metadata["semantic_split_applied"] = semantic_split_applied
+    metadata["semantic_split_applied"] = False
+    metadata["semantic_merge_applied"] = False
+    metadata["hard_split_applied"] = hard_split_applied
     base_text = _join_segment_texts(segments, group_type=group_type)
     metadata["estimated_tokens"] = _estimate_tokens(base_text)
     return ChunkDraft(
@@ -363,7 +372,6 @@ def _build_text_chunk_from_segments(
 def _hard_split_segments(
     segments: list[TextSegment],
     *,
-    group_type: str,
     target_tokens: int,
     max_tokens: int,
     min_tokens: int,
@@ -401,79 +409,16 @@ def _hard_split_segments(
     return parts
 
 
-def _semantic_split_segments(
-    segments: list[TextSegment],
-    *,
-    embedding_client: SemanticEmbeddingClient,
-    target_tokens: int,
-    max_tokens: int,
-    min_tokens: int,
-    similarity_threshold: float,
-) -> list[list[TextSegment]] | None:
-    """인접 segment 유사도가 낮아지는 지점을 우선 경계로 사용하는 split."""
-    if len(segments) < 2:
-        return None
-
-    embeddings = embedding_client.embed_texts(segment.text for segment in segments)
-    if embeddings is None:
-        return None
-
-    similarities = [
-        cosine_similarity(left, right)
-        for left, right in zip(embeddings, embeddings[1:])
-    ]
-
-    parts: list[list[TextSegment]] = []
-    current: list[TextSegment] = []
-    current_tokens = 0
-
-    for index, segment in enumerate(segments):
-        segment_tokens = _estimate_tokens(segment.text)
-        should_split = False
-
-        if current:
-            previous_similarity = similarities[index - 1]
-            projected_tokens = current_tokens + segment_tokens
-            if current_tokens >= min_tokens and projected_tokens > max_tokens:
-                should_split = True
-            elif (
-                current_tokens >= target_tokens
-                and previous_similarity < similarity_threshold
-            ):
-                should_split = True
-            elif (
-                current_tokens >= min_tokens
-                and projected_tokens > target_tokens
-                and previous_similarity < similarity_threshold
-            ):
-                should_split = True
-
-        if should_split:
-            parts.append(current)
-            current = []
-            current_tokens = 0
-
-        current.append(segment)
-        current_tokens += segment_tokens
-
-    if current:
-        if parts and current_tokens < min_tokens:
-            parts[-1].extend(current)
-        else:
-            parts.append(current)
-    return parts
-
-
 def _split_text_draft(
     draft: ChunkDraft,
-    *,
-    embedding_client: SemanticEmbeddingClient,
 ) -> list[ChunkDraft]:
-    """긴 prose chunk를 semantic split 또는 hard split으로 분할한다."""
+    """긴 prose chunk를 구조 기반 hard split으로 분할한다."""
     estimated_tokens = _estimate_tokens(draft.base_text)
     if estimated_tokens <= STAGE3_TEXT_MAX_TOKENS:
         draft.metadata["estimated_tokens"] = estimated_tokens
         draft.metadata["semantic_split_applied"] = False
+        draft.metadata["semantic_merge_applied"] = False
+        draft.metadata["hard_split_applied"] = False
         return [draft]
 
     segments = list(draft.segments)
@@ -488,35 +433,23 @@ def _split_text_draft(
     if len(segments) <= 1:
         draft.metadata["estimated_tokens"] = estimated_tokens
         draft.metadata["semantic_split_applied"] = False
+        draft.metadata["semantic_merge_applied"] = False
+        draft.metadata["hard_split_applied"] = False
         return [draft]
 
-    split_parts: list[list[TextSegment]] | None = None
-    semantic_applied = False
-    if draft.semantic_eligible and STAGE3_ENABLE_SEMANTIC_SPLIT:
-        split_parts = _semantic_split_segments(
-            segments,
-            embedding_client=embedding_client,
-            target_tokens=STAGE3_TEXT_TARGET_TOKENS,
-            max_tokens=STAGE3_TEXT_MAX_TOKENS,
-            min_tokens=STAGE3_TEXT_MIN_TOKENS,
-            similarity_threshold=STAGE3_SEMANTIC_SPLIT_SIM_THRESHOLD,
-        )
-        semantic_applied = split_parts is not None
-
-    if split_parts is None:
-        split_parts = _hard_split_segments(
-            segments,
-            group_type=str(draft.metadata.get("group_type") or "prose"),
-            target_tokens=STAGE3_TEXT_TARGET_TOKENS,
-            max_tokens=STAGE3_TEXT_MAX_TOKENS,
-            min_tokens=STAGE3_TEXT_MIN_TOKENS,
-        )
+    split_parts = _hard_split_segments(
+        segments,
+        target_tokens=STAGE3_TEXT_TARGET_TOKENS,
+        max_tokens=STAGE3_TEXT_MAX_TOKENS,
+        min_tokens=STAGE3_TEXT_MIN_TOKENS,
+    )
+    hard_split_applied = len(split_parts) > 1
 
     return [
         _build_text_chunk_from_segments(
             parent=draft,
             segments=part,
-            semantic_split_applied=semantic_applied,
+            hard_split_applied=hard_split_applied,
         )
         for part in split_parts
         if part
@@ -599,8 +532,10 @@ def _flush_pending_text_units(
             ),
             metadata={
                 "group_type": group_type,
+                "source_run_id": f"text-run-{pending_units[0].element_id}",
                 "semantic_split_applied": False,
                 "semantic_merge_applied": False,
+                "hard_split_applied": False,
                 "estimated_tokens": _estimate_tokens(base_text),
             },
             order_key=(pending_units[0].page, pending_units[0].order),
@@ -677,126 +612,16 @@ def _build_initial_chunk_drafts(elements: list[dict[str, Any]]) -> list[ChunkDra
     return drafts
 
 
-def _apply_semantic_split(
+def _apply_hard_split(
     drafts: list[ChunkDraft],
-    *,
-    embedding_client: SemanticEmbeddingClient,
 ) -> list[ChunkDraft]:
     split_drafts: list[ChunkDraft] = []
     for draft in drafts:
         if draft.chunk_type != "text":
             split_drafts.append(draft)
             continue
-        split_drafts.extend(
-            _split_text_draft(
-                draft,
-                embedding_client=embedding_client,
-            )
-        )
+        split_drafts.extend(_split_text_draft(draft))
     return split_drafts
-
-
-def _merge_text_chunks(
-    left: ChunkDraft,
-    right: ChunkDraft,
-    *,
-    semantic_merge_applied: bool,
-) -> ChunkDraft:
-    merged_segments = left.segments + right.segments
-    parent = ChunkDraft(
-        chunk_type="text",
-        heading_path=list(left.heading_path),
-        base_text="",
-        pages=[],
-        element_ids=[],
-        source_elements=[],
-        metadata={
-            "group_type": left.metadata.get("group_type") or "prose",
-            "semantic_split_applied": bool(
-                left.metadata.get("semantic_split_applied")
-                or right.metadata.get("semantic_split_applied")
-            ),
-            "semantic_merge_applied": semantic_merge_applied,
-        },
-        order_key=left.order_key,
-        semantic_eligible=left.semantic_eligible and right.semantic_eligible,
-        segments=merged_segments,
-    )
-    merged = _build_text_chunk_from_segments(
-        parent=parent,
-        segments=merged_segments,
-        semantic_split_applied=bool(parent.metadata["semantic_split_applied"]),
-    )
-    merged.metadata["semantic_merge_applied"] = semantic_merge_applied
-    return merged
-
-
-def _apply_semantic_merge(
-    drafts: list[ChunkDraft],
-    *,
-    embedding_client: SemanticEmbeddingClient,
-) -> list[ChunkDraft]:
-    if not STAGE3_ENABLE_SEMANTIC_MERGE:
-        return drafts
-
-    merged_drafts: list[ChunkDraft] = []
-    index = 0
-    while index < len(drafts):
-        current = drafts[index]
-        if (
-            index + 1 >= len(drafts)
-            or current.chunk_type != "text"
-            or str(current.metadata.get("group_type")) != "prose"
-        ):
-            merged_drafts.append(current)
-            index += 1
-            continue
-
-        next_chunk = drafts[index + 1]
-        same_heading = current.heading_path == next_chunk.heading_path
-        same_group = (
-            next_chunk.chunk_type == "text"
-            and str(next_chunk.metadata.get("group_type")) == "prose"
-        )
-        current_tokens = _estimate_tokens(current.base_text)
-        next_tokens = _estimate_tokens(next_chunk.base_text)
-        combined_tokens = current_tokens + next_tokens
-        candidate_small = (
-            current_tokens <= STAGE3_SEMANTIC_MERGE_CANDIDATE_MAX_TOKENS
-            or next_tokens <= STAGE3_SEMANTIC_MERGE_CANDIDATE_MAX_TOKENS
-        )
-
-        if not (
-            same_heading
-            and same_group
-            and candidate_small
-            and combined_tokens <= STAGE3_TEXT_MAX_TOKENS
-        ):
-            merged_drafts.append(current)
-            index += 1
-            continue
-
-        embeddings = embedding_client.embed_texts([current.base_text, next_chunk.base_text])
-        if embeddings is None:
-            merged_drafts.append(current)
-            index += 1
-            continue
-
-        similarity = cosine_similarity(embeddings[0], embeddings[1])
-        if similarity < STAGE3_SEMANTIC_MERGE_SIM_THRESHOLD:
-            merged_drafts.append(current)
-            index += 1
-            continue
-
-        current = _merge_text_chunks(
-            current,
-            next_chunk,
-            semantic_merge_applied=True,
-        )
-        drafts[index + 1] = current
-        index += 1
-
-    return merged_drafts
 
 
 def _finalize_chunk_payloads(drafts: list[ChunkDraft]) -> list[ChunkPayload]:
@@ -820,7 +645,13 @@ def _finalize_chunk_payloads(drafts: list[ChunkDraft]) -> list[ChunkPayload]:
             heading_key = tuple(draft.heading_path)
             overlap_text = ""
             previous_chunk = previous_text_by_heading.get(heading_key)
-            if previous_chunk is not None:
+            same_source_run = (
+                previous_chunk is not None
+                and previous_chunk.metadata.get("source_run_id")
+                and previous_chunk.metadata.get("source_run_id")
+                == metadata.get("source_run_id")
+            )
+            if same_source_run and previous_chunk is not None:
                 overlap_text = _take_tail_for_overlap(
                     previous_chunk.base_text,
                     STAGE3_TEXT_OVERLAP_TOKENS,
@@ -870,6 +701,113 @@ def _build_stats(chunks: list[ChunkPayload]) -> Stage3ChunkStats:
     }
 
 
+def _derive_document_id(*, cleaned_json_path: Path) -> str:
+    """stage3 출력물 묶음을 식별할 문서 id를 폴더명 기준으로 만든다."""
+    return cleaned_json_path.parent.name
+
+
+def _build_parent_payloads(
+    chunks: list[ChunkPayload],
+    *,
+    document_id: str,
+) -> tuple[list[ChunkPayload], list[ParentPayload]]:
+    """정렬된 child chunk를 상위 parent 문맥 블록으로 묶는다."""
+    if not chunks:
+        return (chunks, [])
+
+    parent_counter = 0
+    parents: list[ParentPayload] = []
+    current_group: list[ChunkPayload] = []
+    current_heading_path: tuple[str, ...] | None = None
+    current_tokens = 0
+
+    def flush_current_group() -> None:
+        nonlocal parent_counter, current_group, current_heading_path, current_tokens
+        if not current_group:
+            return
+
+        parent_counter += 1
+        parent_id = f"parent-{parent_counter:04d}"
+        pages = _unique_ints(
+            int(page)
+            for chunk in current_group
+            for page in chunk.get("pages") or []
+            if isinstance(page, int) or str(page).isdigit()
+        )
+        heading_path = list(current_group[0].get("heading_path") or [])
+        parent_chunk_types: list[str] = []
+        seen_types: set[str] = set()
+        for chunk in current_group:
+            chunk_type = str(chunk.get("chunk_type") or "")
+            if chunk_type and chunk_type not in seen_types:
+                seen_types.add(chunk_type)
+                parent_chunk_types.append(chunk_type)
+
+        parent_text = "\n\n".join(
+            str(chunk.get("text") or "").strip()
+            for chunk in current_group
+            if str(chunk.get("text") or "").strip()
+        )
+        child_chunk_ids = [
+            str(chunk.get("chunk_id") or "")
+            for chunk in current_group
+            if str(chunk.get("chunk_id") or "")
+        ]
+
+        for chunk in current_group:
+            chunk["parent_id"] = parent_id
+
+        parents.append(
+            {
+                "parent_id": parent_id,
+                "document_id": document_id,
+                "heading_path": heading_path,
+                "section_title": _build_section_title_from_heading_path(heading_path),
+                "pages": pages,
+                "page_start": pages[0] if pages else None,
+                "page_end": pages[-1] if pages else None,
+                "child_chunk_ids": child_chunk_ids,
+                "chunk_types": parent_chunk_types,
+                "text": parent_text,
+                "metadata": {
+                    "child_count": len(current_group),
+                    "estimated_tokens": _estimate_tokens(parent_text),
+                    "has_visual": any(
+                        chunk_type in {"table", "figure"}
+                        for chunk_type in parent_chunk_types
+                    ),
+                },
+            }
+        )
+
+        current_group = []
+        current_heading_path = None
+        current_tokens = 0
+
+    for chunk in chunks:
+        heading_path = tuple(chunk.get("heading_path") or [])
+        chunk_tokens = _estimate_tokens(str(chunk.get("text") or ""))
+        should_flush = False
+
+        if current_group and heading_path != current_heading_path:
+            should_flush = True
+        elif (
+            current_group
+            and current_tokens + chunk_tokens > STAGE3_PARENT_MAX_TOKENS
+        ):
+            should_flush = True
+
+        if should_flush:
+            flush_current_group()
+
+        current_group.append(chunk)
+        current_heading_path = heading_path
+        current_tokens += chunk_tokens
+
+    flush_current_group()
+    return (chunks, parents)
+
+
 def _render_chunk_preview_markdown(
     chunks: list[ChunkPayload],
     *,
@@ -906,6 +844,7 @@ def _render_chunk_preview_markdown(
                 f"## {index}번 청크",
                 "",
                 f"- chunk_id: `{chunk.get('chunk_id')}`",
+                f"- parent_id: `{chunk.get('parent_id')}`",
                 f"- chunk_type: `{chunk.get('chunk_type')}`",
                 f"- pages: `{pages_label}`",
                 f"- heading_path: `{heading_label}`",
@@ -963,19 +902,23 @@ def _render_chunk_preview_markdown(
 
 def _write_chunks(
     chunks: list[ChunkPayload],
+    parents: list[ParentPayload],
     *,
+    document_id: str,
     cleaned_json_path: Path,
     output_paths: Stage3OutputPaths,
 ) -> None:
     json_path = Path(output_paths["chunks_json"])
     jsonl_path = Path(output_paths["chunks_jsonl"])
     markdown_path = Path(output_paths["chunks_md"])
+    parents_path = Path(output_paths["parents_json"])
     json_path.parent.mkdir(parents=True, exist_ok=True)
 
     stats = _build_stats(chunks)
     json_path.write_text(
         json.dumps(
             {
+                "document_id": document_id,
                 "cleaned_json_path": str(cleaned_json_path),
                 "stats": stats,
                 "chunks": chunks,
@@ -992,6 +935,18 @@ def _write_chunks(
         _render_chunk_preview_markdown(
             chunks,
             cleaned_json_path=cleaned_json_path,
+        )
+    )
+    parents_path.write_text(
+        json.dumps(
+            {
+                "document_id": document_id,
+                "cleaned_json_path": str(cleaned_json_path),
+                "parent_count": len(parents),
+                "parents": parents,
+            },
+            ensure_ascii=False,
+            indent=2,
         )
     )
 
@@ -1025,29 +980,22 @@ def run_stage3_chunking(
     cleaned_document = _load_cleaned_document(cleaned_json_path)
     elements = list(cleaned_document.get("elements") or [])
 
-    semantic_client = embedding_client or SemanticEmbeddingClient()
-
     initial_drafts = _build_initial_chunk_drafts(elements)
-    split_drafts = _apply_semantic_split(
-        initial_drafts,
-        embedding_client=semantic_client,
+    split_drafts = _apply_hard_split(initial_drafts)
+    chunks = _finalize_chunk_payloads(split_drafts)
+    document_id = _derive_document_id(cleaned_json_path=cleaned_json_path)
+    chunks, parents = _build_parent_payloads(
+        chunks,
+        document_id=document_id,
     )
-    final_drafts = _apply_semantic_merge(
-        split_drafts,
-        embedding_client=semantic_client,
-    )
-    chunks = _finalize_chunk_payloads(final_drafts)
     _write_chunks(
         chunks,
+        parents,
+        document_id=document_id,
         cleaned_json_path=cleaned_json_path,
         output_paths=output_paths,
     )
 
-    status = (
-        "completed_with_semantic_fallback"
-        if semantic_client.last_error
-        else "completed"
-    )
     stats = _build_stats(chunks)
     return {
         "cleaned_json_path": str(cleaned_json_path),
@@ -1055,10 +1003,11 @@ def run_stage3_chunking(
         "output_paths": output_paths,
         "planned_outputs": output_paths,
         "chunk_count": len(chunks),
+        "parent_count": len(parents),
         "stats": stats,
-        "semantic_enabled": semantic_client.enabled,
-        "semantic_fallback_reason": semantic_client.last_error,
-        "status": status,
+        "semantic_enabled": False,
+        "semantic_fallback_reason": None,
+        "status": "completed",
     }
 
 

@@ -52,6 +52,7 @@ class Stage3IndexingTests(unittest.TestCase):
             "chunks": [
                 {
                     "chunk_id": "text-0001",
+                    "parent_id": "parent-0001",
                     "chunk_type": "text",
                     "text": "첫 번째 청크 본문입니다.",
                     "pages": [1],
@@ -64,6 +65,7 @@ class Stage3IndexingTests(unittest.TestCase):
                 },
                 {
                     "chunk_id": "table-0001",
+                    "parent_id": "parent-0002",
                     "chunk_type": "table",
                     "text": "Table 1. 예시 표\n\n요약 텍스트",
                     "pages": [2, 3],
@@ -117,6 +119,7 @@ class Stage3IndexingTests(unittest.TestCase):
             first_point = fake_qdrant.upsert_batches[0]["points"][0]
             self.assertEqual(first_point["payload"]["document_id"], "doc-001")
             self.assertEqual(first_point["payload"]["chunk_id"], "text-0001")
+            self.assertEqual(first_point["payload"]["parent_id"], "parent-0001")
             self.assertEqual(first_point["payload"]["section_title"], "1. 소개")
             self.assertEqual(first_point["payload"]["primary_page"], 1)
             self.assertFalse(first_point["payload"]["has_asset"])

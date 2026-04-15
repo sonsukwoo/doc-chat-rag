@@ -32,6 +32,7 @@ DEFAULT_CLEANED_JSON_PATH = OUTPUT_ROOT / "1" / "cleaned.json"
 DEFAULT_CHUNKS_JSON_NAME = "chunks.json"
 DEFAULT_CHUNKS_JSONL_NAME = "chunks.jsonl"
 DEFAULT_CHUNKS_MD_NAME = "chunks.md"
+DEFAULT_PARENTS_JSON_NAME = "parents.json"
 
 # 구조 기반 text chunk 목표 크기다. 실제 토큰 계산 대신 보수적인 추정값을 사용한다.
 STAGE3_TEXT_TARGET_TOKENS = int(os.getenv("STAGE3_TEXT_TARGET_TOKENS", "600"))
@@ -40,6 +41,10 @@ STAGE3_TEXT_MIN_TOKENS = int(os.getenv("STAGE3_TEXT_MIN_TOKENS", "180"))
 
 # text chunk에 붙일 이전 문맥 overlap 크기다.
 STAGE3_TEXT_OVERLAP_TOKENS = int(os.getenv("STAGE3_TEXT_OVERLAP_TOKENS", "100"))
+
+# parent chunk는 retrieval 단계에서 child hit를 상위 문맥으로 복원할 때 사용한다.
+# 같은 heading_path 안에서 이 크기를 넘기면 parent를 여러 개로 나눈다.
+STAGE3_PARENT_MAX_TOKENS = int(os.getenv("STAGE3_PARENT_MAX_TOKENS", "1600"))
 
 # semantic split / merge 사용 여부다.
 STAGE3_ENABLE_SEMANTIC = _read_bool("STAGE3_ENABLE_SEMANTIC", True)

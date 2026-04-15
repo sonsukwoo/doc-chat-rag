@@ -26,6 +26,7 @@ class ChunkPayload(TypedDict, total=False):
     """retrieval과 embedding에 바로 사용할 chunk 기본 스키마."""
 
     chunk_id: str
+    parent_id: str
     chunk_type: Literal["text", "table", "figure", "mixed"]
     text: str
     pages: list[int]
@@ -35,12 +36,29 @@ class ChunkPayload(TypedDict, total=False):
     metadata: dict[str, Any]
 
 
+class ParentPayload(TypedDict, total=False):
+    """child chunk를 상위 문맥으로 복원할 때 사용하는 parent 스키마."""
+
+    parent_id: str
+    document_id: str
+    heading_path: list[str]
+    section_title: str | None
+    pages: list[int]
+    page_start: int | None
+    page_end: int | None
+    child_chunk_ids: list[str]
+    chunk_types: list[str]
+    text: str
+    metadata: dict[str, Any]
+
+
 class Stage3OutputPaths(TypedDict):
     """stage3가 기록할 산출물 경로 묶음."""
 
     chunks_json: str
     chunks_jsonl: str
     chunks_md: str
+    parents_json: str
 
 
 class Stage3ChunkStats(TypedDict):
@@ -62,6 +80,7 @@ class Stage3Output(TypedDict, total=False):
     output_paths: Stage3OutputPaths
     planned_outputs: Stage3OutputPaths
     chunk_count: int
+    parent_count: int
     stats: Stage3ChunkStats
     semantic_enabled: bool
     semantic_fallback_reason: str | None

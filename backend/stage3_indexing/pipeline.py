@@ -120,6 +120,7 @@ def _build_qdrant_payload(
     payload: dict[str, Any] = {
         "document_id": document_id,
         "chunk_id": str(chunk.get("chunk_id") or ""),
+        "parent_id": str(chunk.get("parent_id") or "") or None,
         "chunk_type": chunk_type,
         "text": str(chunk.get("text") or ""),
         "section_title": _build_section_title(chunk),
