@@ -13,8 +13,13 @@ from .config import (
     DEFAULT_CHUNKS_JSON_PATH,
     DEFAULT_INDEXING_MANIFEST_NAME,
     STAGE3_ENABLE_INDEXING,
+    STAGE3_BM25_ASCII_FOLDING,
+    STAGE3_BM25_LANGUAGE,
+    STAGE3_BM25_TOKENIZER,
     STAGE3_QDRANT_API_KEY,
     STAGE3_QDRANT_COLLECTION_NAME,
+    STAGE3_QDRANT_BM25_VECTOR_NAME,
+    STAGE3_QDRANT_DENSE_VECTOR_NAME,
     STAGE3_QDRANT_TIMEOUT,
     STAGE3_QDRANT_UPSERT_BATCH_SIZE,
     STAGE3_QDRANT_URL,
@@ -141,6 +146,13 @@ def _build_qdrant_payload(
         **_build_page_fields(chunk),
         "has_asset": has_asset,
     }
+    sparse_role_hints = [
+        str(item).strip()
+        for item in metadata.get("sparse_role_hints") or []
+        if str(item).strip()
+    ]
+    if sparse_role_hints:
+        payload["sparse_role_hints"] = sparse_role_hints
 
     if has_asset:
         payload["asset_kind"] = chunk_type
@@ -156,6 +168,8 @@ def _build_qdrant_points(
     document_id: str,
     chunks: list[dict[str, Any]],
     embeddings: list[list[float]],
+    dense_vector_name: str,
+    bm25_vector_name: str,
 ) -> list[dict[str, Any]]:
     points: list[dict[str, Any]] = []
     for chunk, vector in zip(chunks, embeddings):
@@ -166,10 +180,23 @@ def _build_qdrant_points(
                 f"rag-chat:{document_id}:{chunk_id}",
             )
         )
+        text = _get_chunk_text(chunk)
+        bm25_document: dict[str, Any] = {
+            "text": text,
+            "model": "qdrant/bm25",
+            "options": {
+                "tokenizer": STAGE3_BM25_TOKENIZER,
+                "language": STAGE3_BM25_LANGUAGE,
+                "ascii_folding": STAGE3_BM25_ASCII_FOLDING,
+            },
+        }
         points.append(
             {
                 "id": point_id,
-                "vector": vector,
+                "vector": {
+                    dense_vector_name: vector,
+                    bm25_vector_name: bm25_document,
+                },
                 "payload": _build_qdrant_payload(
                     document_id=document_id,
                     chunk=chunk,
@@ -215,6 +242,8 @@ def run_stage3_indexing(
         inputs.get("collection_name")
         or STAGE3_QDRANT_COLLECTION_NAME
     )
+    dense_vector_name = STAGE3_QDRANT_DENSE_VECTOR_NAME
+    bm25_vector_name = STAGE3_QDRANT_BM25_VECTOR_NAME
     has_qdrant_target = bool(qdrant_client is not None or STAGE3_QDRANT_URL)
     indexing_enabled = bool(
         STAGE3_ENABLE_INDEXING and has_qdrant_target and collection_name
@@ -239,6 +268,9 @@ def run_stage3_indexing(
             "planned_outputs": output_paths,
             "point_count": 0,
             "vector_size": 0,
+            "indexing_mode": "hybrid",
+            "dense_vector_name": dense_vector_name,
+            "bm25_vector_name": bm25_vector_name,
             "indexing_enabled": False,
             "status": "skipped",
             "skip_reason": "indexing_disabled_or_missing_qdrant_config",
@@ -257,6 +289,9 @@ def run_stage3_indexing(
             "planned_outputs": output_paths,
             "point_count": 0,
             "vector_size": 0,
+            "indexing_mode": "hybrid",
+            "dense_vector_name": dense_vector_name,
+            "bm25_vector_name": bm25_vector_name,
             "indexing_enabled": True,
             "status": "skipped",
             "skip_reason": "no_chunks_to_index",
@@ -276,6 +311,8 @@ def run_stage3_indexing(
         document_id=document_id,
         chunks=indexable_chunks,
         embeddings=embeddings,
+        dense_vector_name=dense_vector_name,
+        bm25_vector_name=bm25_vector_name,
     )
 
     owns_client = qdrant_client is None
@@ -285,9 +322,11 @@ def run_stage3_indexing(
         timeout=STAGE3_QDRANT_TIMEOUT,
     )
     try:
-        qdrant_client.ensure_dense_collection(
+        qdrant_client.ensure_hybrid_collection(
             collection_name=collection_name,
             vector_size=vector_size,
+            dense_vector_name=dense_vector_name,
+            bm25_vector_name=bm25_vector_name,
             distance="Cosine",
         )
         for batch in _iter_batches(points, STAGE3_QDRANT_UPSERT_BATCH_SIZE):
@@ -309,6 +348,9 @@ def run_stage3_indexing(
         "planned_outputs": output_paths,
         "point_count": len(points),
         "vector_size": vector_size,
+        "indexing_mode": "hybrid",
+        "dense_vector_name": dense_vector_name,
+        "bm25_vector_name": bm25_vector_name,
         "indexing_enabled": True,
         "status": "completed",
         "skip_reason": None,

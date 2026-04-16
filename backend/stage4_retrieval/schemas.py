@@ -14,8 +14,13 @@ class Stage4Input(TypedDict, total=False):
     output_dir: str
     document_id: str
     collection_name: str
+    retrieval_mode: str
     top_k: int
     fetch_k: int
+    dense_fetch_k: int
+    bm25_fetch_k: int
+    hybrid_rrf_weights: list[float]
+    bm25_excluded_role_hints: list[str]
     restrict_to_document: bool
     score_threshold: float
 
@@ -34,7 +39,8 @@ class RetrievedChunkPayload(TypedDict, total=False):
     chunk_id: str
     parent_id: str | None
     score: float
-    dense_score: float
+    dense_score: float | None
+    bm25_score: float | None
     chunk_type: str
     text: str
     section_title: str | None
@@ -59,8 +65,13 @@ class Stage4Output(TypedDict, total=False):
     output_dir: str
     document_id: str
     collection_name: str
+    retrieval_mode: str
     top_k: int
     fetch_k: int
+    dense_fetch_k: int
+    bm25_fetch_k: int
+    hybrid_rrf_weights: list[float] | None
+    bm25_excluded_role_hints: list[str]
     chunk_count: int
     parent_count: int
     fetched_count: int

@@ -13,17 +13,27 @@ from .config import (
     DEFAULT_CHUNKS_JSON_PATH,
     DEFAULT_PARENTS_JSON_PATH,
     DEFAULT_RETRIEVAL_MANIFEST_NAME,
+    STAGE4_BM25_ASCII_FOLDING,
+    STAGE4_BM25_LANGUAGE,
+    STAGE4_BM25_TOKENIZER,
+    STAGE4_BM25_VECTOR_NAME,
+    STAGE4_BM25_EXCLUDED_ROLE_HINTS,
+    STAGE4_DENSE_VECTOR_NAME,
     STAGE4_FETCH_K,
+    STAGE4_HYBRID_BM25_FETCH_K,
+    STAGE4_HYBRID_DENSE_FETCH_K,
+    STAGE4_HYBRID_RRF_WEIGHTS,
     STAGE4_QDRANT_COLLECTION_NAME,
     STAGE4_QDRANT_API_KEY,
     STAGE4_QDRANT_TIMEOUT,
     STAGE4_QDRANT_URL,
+    STAGE4_RETRIEVAL_MODE,
     STAGE4_RESTRICT_TO_DOCUMENT,
     STAGE4_SCORE_THRESHOLD,
     STAGE4_TOP_K,
 )
 from .parents import load_parent_lookup
-from .qdrant import search_dense_chunks
+from .qdrant import search_dense_chunks, search_hybrid_chunks
 from .schemas import Stage4Input, Stage4Output, Stage4OutputPaths
 
 
@@ -97,6 +107,7 @@ def _normalize_retrieval_hit(
     point: dict[str, Any],
     fallback_document_id: str,
     parent_lookup: dict[str, dict[str, Any]],
+    retrieval_mode: str,
 ) -> dict[str, Any]:
     payload = point.get("payload") or {}
     parent_id = str(payload.get("parent_id") or "").strip() or None
@@ -108,7 +119,12 @@ def _normalize_retrieval_hit(
         "chunk_id": str(payload.get("chunk_id") or ""),
         "parent_id": parent_id,
         "score": float(point.get("score") or 0.0),
-        "dense_score": float(point.get("score") or 0.0),
+        "dense_score": (
+            float(point.get("score") or 0.0)
+            if retrieval_mode == "dense"
+            else None
+        ),
+        "bm25_score": None,
         "chunk_type": str(payload.get("chunk_type") or ""),
         "text": str(payload.get("text") or ""),
         "section_title": (
@@ -203,13 +219,34 @@ def run_stage4_retrieval(
         resolved_inputs.get("collection_name")
         or STAGE4_QDRANT_COLLECTION_NAME
     )
+    retrieval_mode = str(
+        resolved_inputs.get("retrieval_mode") or STAGE4_RETRIEVAL_MODE
+    ).strip().lower() or "hybrid"
     query = str(resolved_inputs.get("query") or "").strip()
     top_k = int(resolved_inputs.get("top_k") or STAGE4_TOP_K)
-    fetch_k = int(resolved_inputs.get("fetch_k") or STAGE4_FETCH_K)
+    shared_fetch_k = int(resolved_inputs.get("fetch_k") or STAGE4_FETCH_K)
+    dense_fetch_k = int(
+        resolved_inputs.get("dense_fetch_k")
+        or resolved_inputs.get("fetch_k")
+        or STAGE4_HYBRID_DENSE_FETCH_K
+    )
+    bm25_fetch_k = int(
+        resolved_inputs.get("bm25_fetch_k")
+        or resolved_inputs.get("fetch_k")
+        or STAGE4_HYBRID_BM25_FETCH_K
+    )
+    hybrid_rrf_weights = resolved_inputs.get("hybrid_rrf_weights")
+    if hybrid_rrf_weights is None:
+        hybrid_rrf_weights = STAGE4_HYBRID_RRF_WEIGHTS
+    bm25_excluded_role_hints = list(
+        resolved_inputs.get("bm25_excluded_role_hints")
+        or STAGE4_BM25_EXCLUDED_ROLE_HINTS
+    )
     restrict_to_document = bool(
         resolved_inputs.get("restrict_to_document", STAGE4_RESTRICT_TO_DOCUMENT)
     )
     score_threshold = resolved_inputs.get("score_threshold", STAGE4_SCORE_THRESHOLD)
+    effective_fetch_k = max(top_k, shared_fetch_k, dense_fetch_k, bm25_fetch_k)
     qdrant_configured = bool(
         (qdrant_client is not None or STAGE4_QDRANT_URL) and collection_name
     )
@@ -223,8 +260,13 @@ def run_stage4_retrieval(
         "output_dir": str(output_dir),
         "document_id": document_id,
         "collection_name": collection_name,
+        "retrieval_mode": retrieval_mode,
         "top_k": top_k,
-        "fetch_k": max(top_k, fetch_k),
+        "fetch_k": effective_fetch_k,
+        "dense_fetch_k": max(top_k, dense_fetch_k),
+        "bm25_fetch_k": max(top_k, bm25_fetch_k),
+        "hybrid_rrf_weights": hybrid_rrf_weights,
+        "bm25_excluded_role_hints": bm25_excluded_role_hints,
         "chunk_count": len(list(chunks_document.get("chunks") or [])),
         "parent_count": len(list(parents_document.get("parents") or [])),
         "fetched_count": 0,
@@ -273,19 +315,47 @@ def run_stage4_retrieval(
         created_qdrant_client = True
 
     try:
-        points = search_dense_chunks(
-            qdrant_client=qdrant_client,
-            collection_name=collection_name,
-            query_vector=embeddings[0],
-            top_k=max(top_k, fetch_k),
-            document_id=document_id,
-            restrict_to_document=restrict_to_document,
-            score_threshold=(
-                float(score_threshold)
-                if score_threshold is not None
-                else None
-            ),
-        )
+        if retrieval_mode == "dense":
+            points = search_dense_chunks(
+                qdrant_client=qdrant_client,
+                collection_name=collection_name,
+                query_vector=embeddings[0],
+                top_k=max(top_k, dense_fetch_k),
+                dense_vector_name=STAGE4_DENSE_VECTOR_NAME,
+                document_id=document_id,
+                restrict_to_document=restrict_to_document,
+                score_threshold=(
+                    float(score_threshold)
+                    if score_threshold is not None
+                    else None
+                ),
+            )
+        else:
+            points = search_hybrid_chunks(
+                qdrant_client=qdrant_client,
+                collection_name=collection_name,
+                query_text=query,
+                query_vector=embeddings[0],
+                top_k=max(top_k, effective_fetch_k),
+                dense_fetch_k=max(top_k, dense_fetch_k),
+                bm25_fetch_k=max(top_k, bm25_fetch_k),
+                dense_vector_name=STAGE4_DENSE_VECTOR_NAME,
+                bm25_vector_name=STAGE4_BM25_VECTOR_NAME,
+                bm25_options={
+                    "tokenizer": STAGE4_BM25_TOKENIZER,
+                    "language": STAGE4_BM25_LANGUAGE,
+                    "ascii_folding": STAGE4_BM25_ASCII_FOLDING,
+                },
+                rrf_weights=hybrid_rrf_weights,
+                bm25_excluded_role_hints=bm25_excluded_role_hints,
+                document_id=document_id,
+                restrict_to_document=restrict_to_document,
+                score_threshold=(
+                    float(score_threshold)
+                    if score_threshold is not None
+                    else None
+                ),
+            )
     finally:
         if created_qdrant_client:
             qdrant_client.close()
@@ -295,6 +365,7 @@ def run_stage4_retrieval(
             point=point,
             fallback_document_id=document_id,
             parent_lookup=parent_lookup,
+            retrieval_mode=retrieval_mode,
         )
         for point in points
     ][:top_k]

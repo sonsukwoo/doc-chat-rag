@@ -36,8 +36,24 @@ STAGE3_QDRANT_URL = os.getenv("STAGE3_QDRANT_URL", "").strip()
 STAGE3_QDRANT_API_KEY = os.getenv("STAGE3_QDRANT_API_KEY", "").strip()
 STAGE3_QDRANT_COLLECTION_NAME = os.getenv(
     "STAGE3_QDRANT_COLLECTION_NAME",
-    "rag_chat",
+    "rag_chat_hybrid",
 ).strip()
+
+# hybrid 컬렉션에서 사용할 named vector 이름이다.
+STAGE3_QDRANT_DENSE_VECTOR_NAME = os.getenv(
+    "STAGE3_QDRANT_DENSE_VECTOR_NAME",
+    "dense",
+).strip()
+STAGE3_QDRANT_BM25_VECTOR_NAME = os.getenv(
+    "STAGE3_QDRANT_BM25_VECTOR_NAME",
+    "bm25",
+).strip()
+
+# BM25 sparse branch가 사용할 텍스트 처리 옵션이다.
+# 한국어/혼합 문서를 고려해 기본 tokenizer는 multilingual로 둔다.
+STAGE3_BM25_TOKENIZER = os.getenv("STAGE3_BM25_TOKENIZER", "multilingual").strip()
+STAGE3_BM25_LANGUAGE = os.getenv("STAGE3_BM25_LANGUAGE", "none").strip()
+STAGE3_BM25_ASCII_FOLDING = _read_bool("STAGE3_BM25_ASCII_FOLDING", False)
 
 # Qdrant upsert 동작 설정이다.
 STAGE3_QDRANT_TIMEOUT = float(os.getenv("STAGE3_QDRANT_TIMEOUT", "30.0"))

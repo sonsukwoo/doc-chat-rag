@@ -21,11 +21,21 @@ class _FakeQdrantClient:
         self.collections = []
         self.upsert_batches = []
 
-    def ensure_dense_collection(self, *, collection_name, vector_size, distance):
+    def ensure_hybrid_collection(
+        self,
+        *,
+        collection_name,
+        vector_size,
+        dense_vector_name,
+        bm25_vector_name,
+        distance,
+    ):
         self.collections.append(
             {
                 "collection_name": collection_name,
                 "vector_size": vector_size,
+                "dense_vector_name": dense_vector_name,
+                "bm25_vector_name": bm25_vector_name,
                 "distance": distance,
             }
         )
@@ -61,7 +71,10 @@ class Stage3IndexingTests(unittest.TestCase):
                     "source_elements": [
                         {"element_id": 1, "page": 1, "category": "paragraph"}
                     ],
-                    "metadata": {"group_type": "prose"},
+                    "metadata": {
+                        "group_type": "prose",
+                        "sparse_role_hints": ["front_matter_like"],
+                    },
                 },
                 {
                     "chunk_id": "table-0001",
@@ -108,21 +121,34 @@ class Stage3IndexingTests(unittest.TestCase):
             self.assertTrue(result["indexing_enabled"])
             self.assertEqual(result["point_count"], 2)
             self.assertEqual(result["vector_size"], 3)
+            self.assertEqual(result["indexing_mode"], "hybrid")
+            self.assertEqual(result["dense_vector_name"], "dense")
+            self.assertEqual(result["bm25_vector_name"], "bm25")
             self.assertTrue(manifest_path.exists())
             self.assertEqual(len(fake_qdrant.collections), 1)
             self.assertEqual(fake_qdrant.collections[0]["distance"], "Cosine")
+            self.assertEqual(fake_qdrant.collections[0]["dense_vector_name"], "dense")
+            self.assertEqual(fake_qdrant.collections[0]["bm25_vector_name"], "bm25")
             self.assertEqual(len(fake_qdrant.upsert_batches), 1)
             self.assertEqual(
                 fake_qdrant.upsert_batches[0]["collection_name"],
                 "rag_chat_test",
             )
             first_point = fake_qdrant.upsert_batches[0]["points"][0]
+            self.assertIn("dense", first_point["vector"])
+            self.assertIn("bm25", first_point["vector"])
+            self.assertEqual(first_point["vector"]["bm25"]["model"], "qdrant/bm25")
+            self.assertEqual(first_point["vector"]["bm25"]["options"]["tokenizer"], "multilingual")
             self.assertEqual(first_point["payload"]["document_id"], "doc-001")
             self.assertEqual(first_point["payload"]["chunk_id"], "text-0001")
             self.assertEqual(first_point["payload"]["parent_id"], "parent-0001")
             self.assertEqual(first_point["payload"]["section_title"], "1. 소개")
             self.assertEqual(first_point["payload"]["primary_page"], 1)
             self.assertFalse(first_point["payload"]["has_asset"])
+            self.assertEqual(
+                first_point["payload"]["sparse_role_hints"],
+                ["front_matter_like"],
+            )
             self.assertNotIn("source_elements", first_point["payload"])
             self.assertNotIn("metadata", first_point["payload"])
 
@@ -186,6 +212,10 @@ class Stage3IndexingTests(unittest.TestCase):
             self.assertEqual(
                 fake_qdrant.upsert_batches[0]["points"][0]["payload"]["chunk_id"],
                 "text-0002",
+            )
+            self.assertIn(
+                "bm25",
+                fake_qdrant.upsert_batches[0]["points"][0]["vector"],
             )
 
 

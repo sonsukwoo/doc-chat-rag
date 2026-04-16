@@ -28,6 +28,8 @@ class _FakeQdrantClient:
         limit=10,
         with_payload=True,
         with_vector=False,
+        using=None,
+        prefetch=None,
         query_filter=None,
         score_threshold=None,
     ):
@@ -38,6 +40,8 @@ class _FakeQdrantClient:
                 "limit": limit,
                 "with_payload": with_payload,
                 "with_vector": with_vector,
+                "using": using,
+                "prefetch": prefetch,
                 "query_filter": query_filter,
                 "score_threshold": score_threshold,
             }
@@ -131,15 +135,17 @@ class Stage4RetrievalTests(unittest.TestCase):
                 json.dumps(parents_payload, ensure_ascii=False, indent=2)
             )
 
+            fake_qdrant = _FakeQdrantClient()
             result = run_stage4_retrieval(
                 {
                     "query": "표 관련 내용을 찾아줘",
                     "chunks_json_path": str(chunks_json_path),
                     "output_dir": str(temp_path),
                     "top_k": 5,
+                    "retrieval_mode": "dense",
                 },
                 embedding_client=_FakeEmbeddingClient(),
-                qdrant_client=_FakeQdrantClient(),
+                qdrant_client=fake_qdrant,
             )
 
             manifest_path = Path(result["output_paths"]["retrieval_manifest"])
@@ -151,10 +157,13 @@ class Stage4RetrievalTests(unittest.TestCase):
             self.assertEqual(result["parent_count"], 2)
             self.assertEqual(result["top_k"], 5)
             self.assertEqual(result["fetch_k"], 20)
+            self.assertEqual(result["retrieval_mode"], "dense")
             self.assertEqual(result["fetched_count"], 2)
             self.assertEqual(result["retrieved_count"], 2)
             self.assertEqual(len(result["retrievals"]), 2)
             self.assertTrue(result["document_filter_applied"])
+            self.assertEqual(len(fake_qdrant.calls), 1)
+            self.assertEqual(fake_qdrant.calls[0]["using"], "dense")
             self.assertFalse(manifest_path.exists())
             self.assertEqual(
                 Path(result["parents_json_path"]).resolve(),
@@ -178,6 +187,128 @@ class Stage4RetrievalTests(unittest.TestCase):
             )
             self.assertEqual(second_hit["caption"], "Table 1. 예시 표")
             self.assertEqual(first_hit["dense_score"], 0.91)
+            self.assertIsNone(first_hit["bm25_score"])
+
+    def test_run_stage4_retrieval_hybrid_smoke(self):
+        chunks_payload = {
+            "cleaned_json_path": "/tmp/sample/cleaned.json",
+            "chunks": [
+                {
+                    "chunk_id": "text-0001",
+                    "parent_id": "parent-0001",
+                    "chunk_type": "text",
+                    "text": "첫 번째 청크입니다.",
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            chunks_json_path = temp_path / "chunks.json"
+            chunks_json_path.write_text(
+                json.dumps(chunks_payload, ensure_ascii=False, indent=2)
+            )
+
+            fake_qdrant = _FakeQdrantClient()
+            result = run_stage4_retrieval(
+                {
+                    "query": "첫 번째 청크를 찾아줘",
+                    "chunks_json_path": str(chunks_json_path),
+                    "output_dir": str(temp_path),
+                    "retrieval_mode": "hybrid",
+                    "top_k": 3,
+                    "dense_fetch_k": 11,
+                    "bm25_fetch_k": 13,
+                },
+                embedding_client=_FakeEmbeddingClient(),
+                qdrant_client=fake_qdrant,
+            )
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["retrieval_mode"], "hybrid")
+            self.assertEqual(result["dense_fetch_k"], 11)
+            self.assertEqual(result["bm25_fetch_k"], 13)
+            self.assertEqual(result["fetch_k"], 20)
+            self.assertIsNone(result["hybrid_rrf_weights"])
+            self.assertEqual(
+                result["bm25_excluded_role_hints"],
+                ["reference_like", "front_matter_like", "title_only"],
+            )
+            self.assertEqual(len(fake_qdrant.calls), 1)
+            first_call = fake_qdrant.calls[0]
+            self.assertEqual(first_call["query"], {"fusion": "rrf"})
+            self.assertEqual(len(first_call["prefetch"]), 2)
+            self.assertEqual(first_call["prefetch"][0]["using"], "dense")
+            self.assertEqual(first_call["prefetch"][1]["using"], "bm25")
+            self.assertIn("filter", first_call["prefetch"][1])
+            self.assertEqual(
+                first_call["prefetch"][1]["filter"]["must_not"],
+                [
+                    {
+                        "key": "sparse_role_hints",
+                        "match": {"value": "reference_like"},
+                    },
+                    {
+                        "key": "sparse_role_hints",
+                        "match": {"value": "front_matter_like"},
+                    },
+                    {
+                        "key": "sparse_role_hints",
+                        "match": {"value": "title_only"},
+                    },
+                ],
+            )
+            self.assertEqual(
+                first_call["prefetch"][1]["query"]["model"],
+                "qdrant/bm25",
+            )
+            self.assertEqual(
+                first_call["prefetch"][1]["query"]["options"]["tokenizer"],
+                "multilingual",
+            )
+            self.assertIsNone(result["retrievals"][0]["dense_score"])
+            self.assertIsNone(result["retrievals"][0]["bm25_score"])
+
+    def test_run_stage4_retrieval_hybrid_weighted_rrf(self):
+        chunks_payload = {
+            "cleaned_json_path": "/tmp/sample/cleaned.json",
+            "chunks": [
+                {
+                    "chunk_id": "text-0001",
+                    "parent_id": "parent-0001",
+                    "chunk_type": "text",
+                    "text": "첫 번째 청크입니다.",
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            chunks_json_path = temp_path / "chunks.json"
+            chunks_json_path.write_text(
+                json.dumps(chunks_payload, ensure_ascii=False, indent=2)
+            )
+
+            fake_qdrant = _FakeQdrantClient()
+            result = run_stage4_retrieval(
+                {
+                    "query": "첫 번째 청크를 찾아줘",
+                    "chunks_json_path": str(chunks_json_path),
+                    "output_dir": str(temp_path),
+                    "retrieval_mode": "hybrid",
+                    "hybrid_rrf_weights": [3.0, 1.0],
+                },
+                embedding_client=_FakeEmbeddingClient(),
+                qdrant_client=fake_qdrant,
+            )
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["hybrid_rrf_weights"], [3.0, 1.0])
+            self.assertEqual(len(fake_qdrant.calls), 1)
+            self.assertEqual(
+                fake_qdrant.calls[0]["query"],
+                {"rrf": {"weights": [3.0, 1.0]}},
+            )
 
     def test_run_stage4_retrieval_without_query_is_skipped(self):
         chunks_payload = {

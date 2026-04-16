@@ -35,6 +35,21 @@ TEXTUAL_CATEGORIES = {"paragraph", "footnote", "list", "code"}
 PROSE_CATEGORIES = {"paragraph", "footnote"}
 SEMANTIC_BOUNDARY_CATEGORIES = {"list", "code", "table", "figure"}
 VISUAL_CATEGORIES = {"table", "figure"}
+REFERENCE_SECTION_HINT_TERMS = {
+    "references",
+    "reference",
+    "bibliography",
+    "works cited",
+    "참고문헌",
+    "참고 자료",
+    "참고자료",
+}
+EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+URL_PATTERN = re.compile(r"\b(?:https?://|www\.)\S+\b", re.IGNORECASE)
+YEAR_PATTERN = re.compile(r"\b(?:19|20)\d{2}\b")
+CITATION_BRACKET_PATTERN = re.compile(r"\[[0-9,\-\s]{1,20}\]")
+CITATION_PAREN_PATTERN = re.compile(r"\([^)]{0,80}\b(?:19|20)\d{2}\b[^)]{0,80}\)")
+SENTENCE_END_PATTERN = re.compile(r"[.!?。！？]\s*$")
 
 
 @dataclass(frozen=True)
@@ -138,6 +153,14 @@ def _build_section_title_from_heading_path(heading_path: Iterable[str]) -> str |
     return " > ".join(normalized)
 
 
+def _normalize_hint_text(text: str | None) -> str:
+    """역할 힌트 비교용 텍스트를 느슨하게 정규화한다."""
+    if not text:
+        return ""
+    normalized = re.sub(r"\s+", " ", str(text).strip().lower())
+    return normalized
+
+
 def _unique_ints(values: Iterable[int]) -> list[int]:
     seen: set[int] = set()
     ordered: list[int] = []
@@ -161,6 +184,142 @@ def _unique_source_elements(
         seen.add(key)
         ordered.append(source)
     return ordered
+
+
+def _count_nonempty_lines(text: str) -> int:
+    return len([line for line in text.splitlines() if line.strip()])
+
+
+def _estimate_sentence_like_ratio(text: str) -> float:
+    """문장 끝맺음이 있는 라인 비율로 본문성 여부를 보수적으로 추정한다."""
+    lines = [_normalize_text(line) for line in text.splitlines() if _normalize_text(line)]
+    if not lines:
+        return 0.0
+    sentence_like_lines = sum(
+        1
+        for line in lines
+        if SENTENCE_END_PATTERN.search(line)
+    )
+    return sentence_like_lines / len(lines)
+
+
+def _build_sparse_role_hints(
+    chunk: ChunkPayload,
+    *,
+    total_pages: int,
+) -> dict[str, Any]:
+    """BM25 전용 필터링에 쓸 약한 역할 힌트를 계산한다."""
+    metadata = chunk.get("metadata") or {}
+    text = _normalize_text(chunk.get("text"))
+    section_title = _build_section_title_from_heading_path(
+        chunk.get("heading_path") or []
+    )
+    normalized_section_title = _normalize_hint_text(section_title)
+    normalized_text = _normalize_hint_text(text)
+    last_heading = _normalize_hint_text((chunk.get("heading_path") or [""])[-1])
+
+    estimated_tokens = int(metadata.get("estimated_tokens") or _estimate_tokens(text))
+    line_count = _count_nonempty_lines(text)
+    has_email = bool(EMAIL_PATTERN.search(text))
+    has_url = bool(URL_PATTERN.search(text))
+    year_like_count = len(YEAR_PATTERN.findall(text))
+    citation_like_count = len(CITATION_BRACKET_PATTERN.findall(text)) + len(
+        CITATION_PAREN_PATTERN.findall(text)
+    )
+    sentence_like_ratio = _estimate_sentence_like_ratio(text)
+
+    page_start = None
+    pages = [int(page) for page in chunk.get("pages") or [] if str(page).isdigit()]
+    if pages:
+        page_start = sorted(set(pages))[0]
+    tail_page_hint = bool(page_start is not None and total_pages >= 4 and page_start >= total_pages - 1)
+    early_page_hint = bool(page_start is not None and page_start <= 2)
+    average_line_tokens = estimated_tokens / line_count if line_count else float(estimated_tokens)
+
+    reference_heading_hint = any(
+        term in normalized_section_title
+        for term in REFERENCE_SECTION_HINT_TERMS
+    )
+    reference_like = bool(
+        reference_heading_hint
+        or (
+            str(chunk.get("chunk_type") or "") == "text"
+            and tail_page_hint
+            and citation_like_count >= 2
+            and year_like_count >= 2
+            and sentence_like_ratio < 0.5
+        )
+    )
+    front_matter_like = bool(
+        str(chunk.get("chunk_type") or "") == "text"
+        and early_page_hint
+        and not reference_like
+        and estimated_tokens <= 160
+        and (
+            has_email
+            or (
+                not section_title
+                and line_count >= 3
+                and average_line_tokens <= 8
+                and sentence_like_ratio < 0.34
+            )
+        )
+    )
+    title_only = bool(
+        str(chunk.get("chunk_type") or "") == "text"
+        and estimated_tokens <= 18
+        and line_count <= 2
+        and sentence_like_ratio < 0.34
+        and not has_email
+        and not has_url
+        and (
+            (last_heading and (normalized_text == last_heading or normalized_text in last_heading or last_heading in normalized_text))
+            or (
+                normalized_section_title
+                and (
+                    normalized_text == normalized_section_title
+                    or normalized_text in normalized_section_title
+                    or normalized_section_title in normalized_text
+                )
+            )
+        )
+    )
+
+    sparse_role_hints: list[str] = []
+    if reference_like:
+        sparse_role_hints.append("reference_like")
+    if front_matter_like:
+        sparse_role_hints.append("front_matter_like")
+    if title_only:
+        sparse_role_hints.append("title_only")
+
+    return {
+        "section_title": section_title,
+        "line_count": line_count,
+        "has_email": has_email,
+        "has_url": has_url,
+        "year_like_count": year_like_count,
+        "citation_like_count": citation_like_count,
+        "sentence_like_ratio": round(sentence_like_ratio, 4),
+        "sparse_role_hints": sparse_role_hints,
+    }
+
+
+def _annotate_sparse_filter_metadata(
+    chunks: list[ChunkPayload],
+    *,
+    total_pages: int,
+) -> list[ChunkPayload]:
+    """stage4가 BM25 필터링에 재사용할 중립 메타데이터를 chunk에 추가한다."""
+    for chunk in chunks:
+        metadata = dict(chunk.get("metadata") or {})
+        sparse_metadata = _build_sparse_role_hints(
+            chunk,
+            total_pages=total_pages,
+        )
+        metadata.update(sparse_metadata)
+        chunk["metadata"] = metadata
+    return chunks
 
 
 def _element_sort_key(element: dict[str, Any]) -> tuple[int, int]:
@@ -983,6 +1142,14 @@ def run_stage3_chunking(
     initial_drafts = _build_initial_chunk_drafts(elements)
     split_drafts = _apply_hard_split(initial_drafts)
     chunks = _finalize_chunk_payloads(split_drafts)
+    total_pages = max(
+        (int(element.get("page") or 0) for element in elements),
+        default=0,
+    )
+    chunks = _annotate_sparse_filter_metadata(
+        chunks,
+        total_pages=total_pages,
+    )
     document_id = _derive_document_id(cleaned_json_path=cleaned_json_path)
     chunks, parents = _build_parent_payloads(
         chunks,

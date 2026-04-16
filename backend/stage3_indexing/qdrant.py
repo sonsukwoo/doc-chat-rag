@@ -43,6 +43,16 @@ class QdrantRestClient:
         collection: dict[str, Any],
     ) -> tuple[int, str] | None:
         """Qdrant collection 응답에서 기본 dense vector 설정을 읽는다."""
+        named_vectors = self._extract_named_dense_vector_configs(collection)
+        if named_vectors is None:
+            return None
+        return named_vectors.get("")
+
+    def _extract_named_dense_vector_configs(
+        self,
+        collection: dict[str, Any],
+    ) -> dict[str, tuple[int, str]] | None:
+        """Qdrant collection 응답에서 dense named vector 설정을 읽는다."""
         result = collection.get("result") or {}
         config = result.get("config") or {}
         params = config.get("params") or {}
@@ -53,9 +63,50 @@ class QdrantRestClient:
             distance = vectors.get("distance")
             if size is None or distance is None:
                 return None
-            return int(size), str(distance)
+            return {"": (int(size), str(distance))}
+
+        if isinstance(vectors, dict):
+            named_vectors: dict[str, tuple[int, str]] = {}
+            for name, vector_config in vectors.items():
+                if not isinstance(vector_config, dict):
+                    continue
+                size = vector_config.get("size")
+                distance = vector_config.get("distance")
+                if size is None or distance is None:
+                    continue
+                named_vectors[str(name)] = (int(size), str(distance))
+            if named_vectors:
+                return named_vectors
 
         return None
+
+    def _extract_sparse_vector_names(
+        self,
+        collection: dict[str, Any],
+    ) -> set[str]:
+        """Qdrant collection 응답에서 sparse named vector 이름을 읽는다."""
+        result = collection.get("result") or {}
+        config = result.get("config") or {}
+        params = config.get("params") or {}
+        sparse_vectors = (
+            params.get("sparse_vectors")
+            or params.get("sparseVectors")
+            or params.get("sparse_vectors_config")
+        )
+
+        if isinstance(sparse_vectors, dict) and (
+            "modifier" in sparse_vectors or "index" in sparse_vectors
+        ):
+            return {""}
+
+        if not isinstance(sparse_vectors, dict):
+            return set()
+
+        return {
+            str(name)
+            for name, vector_config in sparse_vectors.items()
+            if isinstance(vector_config, dict)
+        }
 
     def ensure_dense_collection(
         self,
@@ -95,6 +146,61 @@ class QdrantRestClient:
         response.raise_for_status()
         return {"created": True, "collection": response.json()}
 
+    def ensure_hybrid_collection(
+        self,
+        *,
+        collection_name: str,
+        vector_size: int,
+        dense_vector_name: str = "dense",
+        bm25_vector_name: str = "bm25",
+        distance: str = "Cosine",
+    ) -> dict[str, Any]:
+        """dense+bM25 sparse 컬렉션이 없으면 생성하고, 있으면 스키마를 검증한다."""
+        existing = self.get_collection(collection_name)
+        if existing is not None:
+            dense_vectors = self._extract_named_dense_vector_configs(existing)
+            if dense_vectors is None or dense_vector_name not in dense_vectors:
+                raise ValueError(
+                    f"Qdrant collection '{collection_name}'에서 dense named vector '{dense_vector_name}'를 찾지 못했습니다."
+                )
+
+            existing_size, existing_distance = dense_vectors[dense_vector_name]
+            if existing_size != vector_size or existing_distance != distance:
+                raise ValueError(
+                    "Qdrant collection schema mismatch: "
+                    f"name={collection_name}, "
+                    f"expected_dense(name={dense_vector_name}, size={vector_size}, distance={distance}), "
+                    f"actual_dense(name={dense_vector_name}, size={existing_size}, distance={existing_distance})"
+                )
+
+            sparse_vector_names = self._extract_sparse_vector_names(existing)
+            if bm25_vector_name not in sparse_vector_names:
+                raise ValueError(
+                    "Qdrant collection schema mismatch: "
+                    f"name={collection_name}, missing_sparse={bm25_vector_name}"
+                )
+
+            return {"created": False, "collection": existing}
+
+        response = self._client.put(
+            f"/collections/{collection_name}",
+            json={
+                "vectors": {
+                    dense_vector_name: {
+                        "size": vector_size,
+                        "distance": distance,
+                    }
+                },
+                "sparse_vectors": {
+                    bm25_vector_name: {
+                        "modifier": "idf",
+                    }
+                },
+            },
+        )
+        response.raise_for_status()
+        return {"created": True, "collection": response.json()}
+
     def upsert_points(
         self,
         *,
@@ -115,20 +221,26 @@ class QdrantRestClient:
         self,
         *,
         collection_name: str,
-        query: list[float],
+        query: Any,
         limit: int = 10,
         with_payload: bool | list[str] | dict[str, Any] = True,
         with_vector: bool = False,
+        using: str | None = None,
+        prefetch: list[dict[str, Any]] | None = None,
         query_filter: dict[str, Any] | None = None,
         score_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
-        """dense query vector로 point top-k를 조회한다."""
+        """dense/hybrid query payload로 point top-k를 조회한다."""
         request_payload: dict[str, Any] = {
             "query": query,
             "limit": limit,
             "with_payload": with_payload,
             "with_vector": with_vector,
         }
+        if using:
+            request_payload["using"] = using
+        if prefetch:
+            request_payload["prefetch"] = prefetch
         if query_filter:
             request_payload["filter"] = query_filter
         if score_threshold is not None:

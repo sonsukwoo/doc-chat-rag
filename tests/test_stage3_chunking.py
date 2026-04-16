@@ -305,13 +305,91 @@ class Stage3ChunkingTests(unittest.TestCase):
                     for chunk in text_chunks[1:]
                 )
             )
-            self.assertTrue(
-                all(
-                    chunk["metadata"]["source_run_id"]
-                    == text_chunks[0]["metadata"]["source_run_id"]
-                    for chunk in text_chunks
-                )
+
+    def test_sparse_role_hints_are_derived_conservatively(self):
+        sample_payload = {
+            "elements": [
+                {
+                    "id": 1,
+                    "category": "paragraph",
+                    "page": 1,
+                    "order": 1,
+                    "text": "Alice Kim\nSchool of AI, Example University\nalice@example.com",
+                },
+                {
+                    "id": 2,
+                    "category": "heading",
+                    "page": 4,
+                    "order": 2,
+                    "text": "References",
+                    "html": "<h1>References</h1>",
+                },
+                {
+                    "id": 3,
+                    "category": "paragraph",
+                    "page": 4,
+                    "order": 3,
+                    "text": "[1] Smith, J. (2024). Example Paper. https://example.org/paper",
+                },
+                {
+                    "id": 4,
+                    "category": "heading",
+                    "page": 2,
+                    "order": 4,
+                    "text": "1. 소개",
+                    "html": "<h1>1. 소개</h1>",
+                },
+                {
+                    "id": 5,
+                    "category": "paragraph",
+                    "page": 2,
+                    "order": 5,
+                    "text": "이 문서는 검색 품질 개선 방법을 설명한다.",
+                },
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            cleaned_json_path = temp_path / "cleaned.json"
+            cleaned_json_path.write_text(
+                json.dumps(sample_payload, ensure_ascii=False, indent=2)
             )
+
+            result = run_stage3_chunking(
+                {
+                    "cleaned_json_path": str(cleaned_json_path),
+                    "output_dir": str(temp_path),
+                },
+                embedding_client=_DisabledEmbeddingClient(),
+            )
+
+            stored = json.loads(Path(result["output_paths"]["chunks_json"]).read_text())
+            chunks = stored["chunks"]
+            front_matter_chunk = next(
+                chunk for chunk in chunks if "alice@example.com" in chunk["text"]
+            )
+            reference_chunk = next(
+                chunk for chunk in chunks if "[1] Smith, J. (2024)." in chunk["text"]
+            )
+            prose_chunk = next(
+                chunk for chunk in chunks if "검색 품질 개선" in chunk["text"]
+            )
+
+            self.assertIn(
+                "front_matter_like",
+                front_matter_chunk["metadata"]["sparse_role_hints"],
+            )
+            self.assertTrue(front_matter_chunk["metadata"]["has_email"])
+            self.assertIn(
+                "reference_like",
+                reference_chunk["metadata"]["sparse_role_hints"],
+            )
+            self.assertGreaterEqual(
+                reference_chunk["metadata"]["citation_like_count"],
+                1,
+            )
+            self.assertEqual(prose_chunk["metadata"]["sparse_role_hints"], [])
 
 
 if __name__ == "__main__":

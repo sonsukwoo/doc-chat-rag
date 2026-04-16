@@ -31,6 +31,9 @@ class Stage3IndexOutput(TypedDict, total=False):
     planned_outputs: Stage3IndexOutputPaths
     point_count: int
     vector_size: int
+    indexing_mode: str
+    dense_vector_name: str
+    bm25_vector_name: str
     indexing_enabled: bool
     status: Literal["completed", "skipped"]
     skip_reason: str | None
