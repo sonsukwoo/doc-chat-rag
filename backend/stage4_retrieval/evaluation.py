@@ -185,6 +185,17 @@ def run_stage4_retrieval_evaluation(
             raise ValueError(f"doc_id={doc_id} 문서 메타데이터가 없습니다.")
 
         source_dir = Path(str(document["source_dir"])).expanduser().resolve()
+        stage3_dir = source_dir / "stage3"
+        chunks_json_path = (
+            (stage3_dir / "chunks.json").resolve()
+            if (stage3_dir / "chunks.json").exists()
+            else (source_dir / "chunks.json").resolve()
+        )
+        parents_json_path = (
+            (stage3_dir / "parents.json").resolve()
+            if (stage3_dir / "parents.json").exists()
+            else (source_dir / "parents.json").resolve()
+        )
         query = str(case["query"])
         gold_chunk_ids = [str(item) for item in case.get("gold_chunk_ids") or []]
         gold_parent_ids = [str(item) for item in case.get("gold_parent_ids") or []]
@@ -193,9 +204,9 @@ def run_stage4_retrieval_evaluation(
             retrieval_output = runner(
                 {
                     "query": query,
-                    "chunks_json_path": str((source_dir / "chunks.json").resolve()),
-                    "parents_json_path": str((source_dir / "parents.json").resolve()),
-                    "output_dir": str(source_dir),
+                    "chunks_json_path": str(chunks_json_path),
+                    "parents_json_path": str(parents_json_path),
+                    "output_dir": str((source_dir / "stage4").resolve() if (source_dir / "stage4").exists() else source_dir),
                     "document_id": doc_id,
                     "collection_name": collection_name,
                     "top_k": top_k,

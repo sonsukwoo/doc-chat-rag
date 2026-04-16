@@ -26,7 +26,7 @@ def _read_bool(name: str, default: bool) -> bool:
 
 # stage3를 단독 실행할 때 사용할 기본 cleaned.json 입력 경로다.
 # 이후 상위 통합 파이프라인이 생기면 함수 인자로 넘기는 방식으로 교체할 수 있다.
-DEFAULT_CLEANED_JSON_PATH = OUTPUT_ROOT / "1" / "cleaned.json"
+DEFAULT_CLEANED_JSON_PATH = OUTPUT_ROOT / "1" / "stage2" / "cleaned.json"
 
 # stage3 산출물 파일명 규칙이다.
 DEFAULT_CHUNKS_JSON_NAME = "chunks.json"

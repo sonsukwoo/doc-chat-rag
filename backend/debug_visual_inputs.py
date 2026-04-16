@@ -79,7 +79,11 @@ def parse_args() -> argparse.Namespace:
 
 def load_cached_document_profile(raw_json_path: Path) -> dict[str, Any] | None:
     """같은 폴더의 cleaned.json에서 기존 document_profile을 읽는다."""
-    cleaned_json_path = raw_json_path.parent / "cleaned.json"
+    cleaned_json_path = (
+        raw_json_path.parent.parent / "stage2" / "cleaned.json"
+        if raw_json_path.parent.name == "stage1"
+        else raw_json_path.parent / "cleaned.json"
+    )
     if not cleaned_json_path.exists():
         return None
 

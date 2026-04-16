@@ -84,8 +84,8 @@ def _read_text_list(name: str, default: list[str]) -> list[str]:
 
 
 # stage4 단독 실행 시 기본으로 참조할 chunk/parent 입력 경로다.
-DEFAULT_CHUNKS_JSON_PATH = OUTPUT_ROOT / "1" / "chunks.json"
-DEFAULT_PARENTS_JSON_PATH = OUTPUT_ROOT / "1" / "parents.json"
+DEFAULT_CHUNKS_JSON_PATH = OUTPUT_ROOT / "1" / "stage3" / "chunks.json"
+DEFAULT_PARENTS_JSON_PATH = OUTPUT_ROOT / "1" / "stage3" / "parents.json"
 
 # 검색 결과 메타데이터를 문서 폴더에 남길 manifest 파일명이다.
 DEFAULT_RETRIEVAL_MANIFEST_NAME = "retrieval.json"

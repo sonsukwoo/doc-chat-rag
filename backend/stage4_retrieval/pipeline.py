@@ -44,10 +44,15 @@ def build_stage4_output_paths(
 ) -> Stage4OutputPaths:
     """stage4가 기록할 retrieval 산출물 경로를 계산한다."""
     chunks_path = Path(chunks_json_path).expanduser().resolve()
+    default_output_dir = (
+        chunks_path.parent.parent / "stage4"
+        if chunks_path.parent.name == "stage3"
+        else chunks_path.parent.resolve()
+    )
     resolved_output_dir = (
         Path(output_dir).expanduser().resolve()
         if output_dir is not None
-        else chunks_path.parent.resolve()
+        else default_output_dir
     )
     return {
         "retrieval_manifest": str(
@@ -74,8 +79,13 @@ def _derive_document_id(
 
     cleaned_json_path = chunks_document.get("cleaned_json_path")
     if cleaned_json_path:
-        return Path(str(cleaned_json_path)).expanduser().resolve().parent.name
+        resolved = Path(str(cleaned_json_path)).expanduser().resolve()
+        if resolved.parent.name in {"stage2", "review"}:
+            return resolved.parent.parent.name
+        return resolved.parent.name
 
+    if chunks_json_path.parent.name == "stage3":
+        return chunks_json_path.parent.parent.name
     return chunks_json_path.parent.name
 
 
@@ -90,6 +100,9 @@ def _resolve_parents_json_path(
     inferred_path = (output_dir / DEFAULT_PARENTS_JSON_PATH.name).resolve()
     if inferred_path.exists():
         return inferred_path
+    sibling_stage3_path = (output_dir.parent / "stage3" / DEFAULT_PARENTS_JSON_PATH.name).resolve()
+    if output_dir.name == "stage4" and sibling_stage3_path.exists():
+        return sibling_stage3_path
     return None
 
 
@@ -191,7 +204,11 @@ def run_stage4_retrieval(
     output_dir = (
         Path(resolved_inputs["output_dir"]).expanduser().resolve()
         if resolved_inputs.get("output_dir")
-        else chunks_json_path.parent.resolve()
+        else (
+            chunks_json_path.parent.parent / "stage4"
+            if chunks_json_path.parent.name == "stage3"
+            else chunks_json_path.parent.resolve()
+        )
     )
     output_paths = build_stage4_output_paths(
         chunks_json_path=chunks_json_path,

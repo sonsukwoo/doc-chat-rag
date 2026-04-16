@@ -155,6 +155,7 @@ class PreprocessInputState(TypedDict, total=False):
 
     raw_json_path: str  # stage-1 raw JSON 파일 경로
     source_pdf_path: str  # 선택적으로 override 가능한 원본 PDF 파일 경로
+    output_dir: str  # cleaned 산출물을 따로 저장하고 싶을 때 주는 출력 폴더
 
 
 class PreprocessRuntimeState(TypedDict, total=False):

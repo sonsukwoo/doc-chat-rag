@@ -12,6 +12,9 @@ class Stage1Input(TypedDict, total=False):
 
     pdf_path: str
     output_root: str
+    output_dir: str
+    json_name: str
+    copy_source_pdf: bool
 
 
 class Stage1ProcessResult(TypedDict):

@@ -39,10 +39,15 @@ def build_stage3_index_output_paths(
 ) -> Stage3IndexOutputPaths:
     """stage3 indexing이 기록할 산출물 경로를 계산한다."""
     chunks_path = Path(chunks_json_path).expanduser().resolve()
+    default_output_dir = (
+        chunks_path.parent
+        if chunks_path.parent.name == "stage3"
+        else chunks_path.parent.resolve()
+    )
     resolved_output_dir = (
         Path(output_dir).expanduser().resolve()
         if output_dir is not None
-        else chunks_path.parent.resolve()
+        else default_output_dir
     )
     return {
         "indexing_manifest": str(
@@ -69,8 +74,13 @@ def _derive_document_id(
 
     cleaned_json_path = chunks_document.get("cleaned_json_path")
     if cleaned_json_path:
-        return Path(str(cleaned_json_path)).expanduser().resolve().parent.name
+        resolved = Path(str(cleaned_json_path)).expanduser().resolve()
+        if resolved.parent.name in {"stage2", "review"}:
+            return resolved.parent.parent.name
+        return resolved.parent.name
 
+    if chunks_json_path.parent.name == "stage3":
+        return chunks_json_path.parent.parent.name
     return chunks_json_path.parent.name
 
 
@@ -231,7 +241,11 @@ def run_stage3_indexing(
     output_dir = (
         Path(inputs["output_dir"]).expanduser().resolve()
         if inputs.get("output_dir")
-        else chunks_json_path.parent.resolve()
+        else (
+            chunks_json_path.parent
+            if chunks_json_path.parent.name == "stage3"
+            else chunks_json_path.parent.resolve()
+        )
     )
     output_paths = build_stage3_index_output_paths(
         chunks_json_path=chunks_json_path,

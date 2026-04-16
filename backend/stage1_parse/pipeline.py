@@ -433,14 +433,26 @@ class UpstageStyleDoclingParser:
             }
         )
 
-    def process_pdf(self, pdf_path: Path) -> Stage1ProcessResult:
+    def process_pdf(
+        self,
+        pdf_path: Path,
+        *,
+        output_dir: Path | None = None,
+        json_name: str = "raw.json",
+        copy_source_pdf: bool = COPY_SOURCE_PDF,
+    ) -> Stage1ProcessResult:
         """PDF 하나를 처리해 raw JSON과 원본 PDF 사본을 만든다."""
         pdf_path = Path(pdf_path).expanduser().resolve()
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
         stem = sanitize_stem(pdf_path.stem)
-        assets_dir = safe_mkdir(self.output_root / stem)
+        if output_dir is not None:
+            assets_dir = safe_mkdir(Path(output_dir).expanduser().resolve())
+            document_root = assets_dir.parent if assets_dir.name == "stage1" else assets_dir
+        else:
+            document_root = safe_mkdir(self.output_root / stem)
+            assets_dir = safe_mkdir(document_root / "stage1")
 
         # 1) 최소 페이지 메타데이터를 확보한다.
         page_metrics = self._collect_page_metrics(pdf_path)
@@ -458,8 +470,13 @@ class UpstageStyleDoclingParser:
             elements=ordered_elements,
         )
 
-        json_path = safe_write_json(assets_dir / f"{stem}.json", payload)
-        copied_pdf_path = self._copy_source_pdf(pdf_path=pdf_path, stem=stem)
+        json_path = safe_write_json(assets_dir / json_name, payload)
+        copied_pdf_path = self._copy_source_pdf(
+            pdf_path=pdf_path,
+            stem=stem,
+            document_root=document_root,
+            copy_source_pdf=copy_source_pdf,
+        )
 
         return {
             "status": "success",
@@ -506,12 +523,19 @@ class UpstageStyleDoclingParser:
             "elements": json_elements,
         }
 
-    def _copy_source_pdf(self, pdf_path: Path, stem: str) -> Optional[Path]:
+    def _copy_source_pdf(
+        self,
+        pdf_path: Path,
+        stem: str,
+        *,
+        document_root: Path,
+        copy_source_pdf: bool,
+    ) -> Optional[Path]:
         """원본 PDF를 결과 폴더에 함께 보관할지 결정한다."""
-        if not COPY_SOURCE_PDF:
+        if not copy_source_pdf:
             return None
 
-        copied_pdf_path = ensure_within_backend(self.output_root / stem / f"{stem}.pdf")
+        copied_pdf_path = ensure_within_backend(document_root / "source" / "original.pdf")
         copied_pdf_path.parent.mkdir(parents=True, exist_ok=True)
         if pdf_path.resolve() == copied_pdf_path.resolve():
             return copied_pdf_path
@@ -642,10 +666,18 @@ def run_stage1_parse(
     pdf_path: str | Path = INPUT_PDF_PATH,
     *,
     output_root: str | Path = OUTPUT_ROOT,
+    output_dir: str | Path | None = None,
+    json_name: str = "raw.json",
+    copy_source_pdf: bool = COPY_SOURCE_PDF,
 ) -> Stage1ProcessResult:
     """stage1 파서를 함수 형태로 실행해 상위 파이프라인에서 재사용할 수 있게 한다."""
     parser = UpstageStyleDoclingParser(output_root=Path(output_root))
-    return parser.process_pdf(Path(pdf_path))
+    return parser.process_pdf(
+        Path(pdf_path),
+        output_dir=Path(output_dir) if output_dir is not None else None,
+        json_name=json_name,
+        copy_source_pdf=copy_source_pdf,
+    )
 
 
 def main() -> None:

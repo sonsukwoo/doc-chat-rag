@@ -19,7 +19,7 @@ load_dotenv(ENV_PATH)
 
 # stage2를 직접 실행할 때 사용할 기본 raw.json 입력 경로다.
 # 현재는 CLI 인자를 따로 받지 않으므로, `python -m backend.stage2` 실행 시 이 값을 사용한다.
-DEFAULT_RAW_JSON_PATH = BACKEND_DIR / "outputs" / "1" / "1.json"
+DEFAULT_RAW_JSON_PATH = BACKEND_DIR / "outputs" / "1" / "stage1" / "raw.json"
 
 # figure 검토, VLM 기반 table summary에 사용할 멀티모달 모델 이름이다.
 # `.env`에 없으면 기본값으로 `gpt-4o-mini`를 사용한다.

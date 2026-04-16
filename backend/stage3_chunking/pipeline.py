@@ -112,10 +112,15 @@ def build_stage3_output_paths(
 ) -> Stage3OutputPaths:
     """stage3가 기록할 chunk 산출물 경로를 계산한다."""
     cleaned_path = Path(cleaned_json_path).expanduser().resolve()
+    default_output_dir = (
+        cleaned_path.parent.parent / "stage3"
+        if cleaned_path.parent.name in {"stage2", "review"}
+        else cleaned_path.parent.resolve()
+    )
     resolved_output_dir = (
         Path(output_dir).expanduser().resolve()
         if output_dir is not None
-        else cleaned_path.parent.resolve()
+        else default_output_dir
     )
     return {
         "chunks_json": str((resolved_output_dir / DEFAULT_CHUNKS_JSON_NAME).resolve()),
@@ -862,6 +867,8 @@ def _build_stats(chunks: list[ChunkPayload]) -> Stage3ChunkStats:
 
 def _derive_document_id(*, cleaned_json_path: Path) -> str:
     """stage3 출력물 묶음을 식별할 문서 id를 폴더명 기준으로 만든다."""
+    if cleaned_json_path.parent.name in {"stage2", "review"}:
+        return cleaned_json_path.parent.parent.name
     return cleaned_json_path.parent.name
 
 
@@ -1129,7 +1136,11 @@ def run_stage3_chunking(
     output_dir = (
         Path(inputs["output_dir"]).expanduser().resolve()
         if inputs.get("output_dir")
-        else cleaned_json_path.parent.resolve()
+        else (
+            cleaned_json_path.parent.parent / "stage3"
+            if cleaned_json_path.parent.name in {"stage2", "review"}
+            else cleaned_json_path.parent.resolve()
+        )
     )
     output_paths = build_stage3_output_paths(
         cleaned_json_path=cleaned_json_path,

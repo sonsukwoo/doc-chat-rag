@@ -197,6 +197,7 @@ def main() -> None:
     """기본 raw.json 입력으로 stage-2 그래프를 한 번 실행한다."""
     graph_input: PreprocessInputState = {
         "raw_json_path": str(DEFAULT_RAW_JSON_PATH),
+        "output_dir": str(DEFAULT_RAW_JSON_PATH.parent.parent / "stage2"),
     }
     response = get_agent().invoke(graph_input)
     print(

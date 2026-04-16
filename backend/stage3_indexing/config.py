@@ -26,7 +26,7 @@ def _read_bool(name: str, default: bool) -> bool:
 
 
 # stage3 인덱싱을 단독 실행할 때 사용할 기본 chunks.json 입력 경로다.
-DEFAULT_CHUNKS_JSON_PATH = OUTPUT_ROOT / "1" / "chunks.json"
+DEFAULT_CHUNKS_JSON_PATH = OUTPUT_ROOT / "1" / "stage3" / "chunks.json"
 
 # chunk 생성 이후 Qdrant 업로드까지 자동으로 이어서 수행할지 결정한다.
 STAGE3_ENABLE_INDEXING = _read_bool("STAGE3_ENABLE_INDEXING", True)

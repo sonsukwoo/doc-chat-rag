@@ -87,10 +87,21 @@ def load_raw_document(state: PreprocessState) -> dict[str, Any]:
     raw_json_path = Path(state["raw_json_path"]).expanduser().resolve()
     payload = json.loads(raw_json_path.read_text(encoding="utf-8"))
 
+    if raw_json_path.parent.name == "stage1":
+        default_output_dir = raw_json_path.parent.parent / "stage2"
+        default_source_pdf_path = raw_json_path.parent.parent / "source" / "original.pdf"
+    else:
+        default_output_dir = raw_json_path.parent
+        default_source_pdf_path = raw_json_path.with_suffix(".pdf")
+
     source_pdf_path = Path(
-        state.get("source_pdf_path") or payload.get("source_pdf") or raw_json_path.with_suffix(".pdf")
+        state.get("source_pdf_path")
+        or payload.get("source_pdf")
+        or default_source_pdf_path
     ).expanduser().resolve()
-    output_dir = raw_json_path.parent.resolve()
+    output_dir = Path(
+        state.get("output_dir") or default_output_dir
+    ).expanduser().resolve()
 
     with fitz.open(str(source_pdf_path)) as pdf:
         page_metrics: dict[int, PageMetric] = {
