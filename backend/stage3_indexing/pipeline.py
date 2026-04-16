@@ -74,9 +74,23 @@ def _iter_batches(items: list[Any], batch_size: int) -> Iterable[list[Any]]:
         yield items[start_index : start_index + batch_size]
 
 
+def _get_chunk_text(chunk: dict[str, Any]) -> str:
+    """chunk에서 인덱싱에 사용할 본문 텍스트를 정규화해 꺼낸다."""
+    return str(chunk.get("text") or "").strip()
+
+
+def _select_indexable_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """임베딩 가치가 없는 빈 청크는 Qdrant 업로드 대상에서 제외한다."""
+    return [chunk for chunk in chunks if _get_chunk_text(chunk)]
+
+
 def _build_section_title(chunk: dict[str, Any]) -> str | None:
     """heading path를 사람이 보기 쉬운 섹션 문자열로 평탄화한다."""
-    heading_path = [str(item).strip() for item in chunk.get("heading_path") or [] if str(item).strip()]
+    heading_path = [
+        str(item).strip()
+        for item in chunk.get("heading_path") or []
+        if str(item).strip()
+    ]
     if not heading_path:
         return None
     return " > ".join(heading_path)
@@ -122,7 +136,7 @@ def _build_qdrant_payload(
         "chunk_id": str(chunk.get("chunk_id") or ""),
         "parent_id": str(chunk.get("parent_id") or "") or None,
         "chunk_type": chunk_type,
-        "text": str(chunk.get("text") or ""),
+        "text": _get_chunk_text(chunk),
         "section_title": _build_section_title(chunk),
         **_build_page_fields(chunk),
         "has_asset": has_asset,
@@ -208,6 +222,7 @@ def run_stage3_indexing(
 
     chunks_document = _load_chunks_document(chunks_json_path)
     chunks = list(chunks_document.get("chunks") or [])
+    indexable_chunks = _select_indexable_chunks(chunks)
     document_id = _derive_document_id(
         chunks_json_path=chunks_json_path,
         chunks_document=chunks_document,
@@ -231,7 +246,7 @@ def run_stage3_indexing(
         _write_index_manifest(output, output_paths=output_paths)
         return output
 
-    texts = [str(chunk.get("text") or "").strip() for chunk in chunks]
+    texts = [_get_chunk_text(chunk) for chunk in indexable_chunks]
     if not texts:
         output = {
             "chunks_json_path": str(chunks_json_path),
@@ -259,7 +274,7 @@ def run_stage3_indexing(
     vector_size = len(embeddings[0])
     points = _build_qdrant_points(
         document_id=document_id,
-        chunks=chunks,
+        chunks=indexable_chunks,
         embeddings=embeddings,
     )
 

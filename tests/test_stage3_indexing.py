@@ -140,6 +140,54 @@ class Stage3IndexingTests(unittest.TestCase):
             )
             self.assertEqual(second_point["payload"]["caption"], "Table 1. 예시 표")
 
+    def test_run_stage3_indexing_skips_empty_chunks(self):
+        sample_payload = {
+            "cleaned_json_path": "/tmp/sample/cleaned.json",
+            "chunks": [
+                {
+                    "chunk_id": "text-0001",
+                    "parent_id": "parent-0001",
+                    "chunk_type": "text",
+                    "text": "   ",
+                },
+                {
+                    "chunk_id": "text-0002",
+                    "parent_id": "parent-0002",
+                    "chunk_type": "text",
+                    "text": "실제 본문입니다.",
+                    "pages": [1],
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            chunks_json_path = temp_path / "chunks.json"
+            chunks_json_path.write_text(
+                json.dumps(sample_payload, ensure_ascii=False, indent=2)
+            )
+
+            fake_qdrant = _FakeQdrantClient()
+            result = run_stage3_indexing(
+                {
+                    "chunks_json_path": str(chunks_json_path),
+                    "output_dir": str(temp_path),
+                    "document_id": "doc-001",
+                    "collection_name": "rag_chat_test",
+                },
+                embedding_client=_FakeEmbeddingClient(),
+                qdrant_client=fake_qdrant,
+            )
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["point_count"], 1)
+            self.assertEqual(len(fake_qdrant.upsert_batches), 1)
+            self.assertEqual(len(fake_qdrant.upsert_batches[0]["points"]), 1)
+            self.assertEqual(
+                fake_qdrant.upsert_batches[0]["points"][0]["payload"]["chunk_id"],
+                "text-0002",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

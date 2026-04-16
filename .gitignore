@@ -11,6 +11,12 @@ env/
 outputs/
 backend/outputs/
 
+# Evaluation artifacts
+# 평가셋과 대표 실험 스냅샷은 추적하고, 반복 실행으로 쌓이는 리포트만 제외한다.
+eval/reports/
+eval/experiments/**/artifacts/
+eval/experiments/**/raw_outputs/
+
 # Python cache
 __pycache__/
 *.pyc
