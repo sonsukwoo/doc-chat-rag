@@ -53,6 +53,14 @@ def _read_optional_float(name: str) -> float | None:
     return float(normalized)
 
 
+def _read_float(name: str, default: float) -> float:
+    """환경변수를 float 설정값으로 읽는다."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return float(raw_value.strip())
+
+
 def _read_optional_float_list(name: str) -> list[float] | None:
     """쉼표 구분 float 목록을 읽는다. 비어 있으면 None을 반환한다."""
     raw_value = os.getenv(name)
@@ -111,8 +119,8 @@ STAGE4_QDRANT_TIMEOUT = float(
     )
 )
 
-# stage4 retrieval 기본 모드다. hybrid를 기본값으로 두고, dense baseline 비교는 옵션으로 남긴다.
-STAGE4_RETRIEVAL_MODE = _read_text("STAGE4_RETRIEVAL_MODE", "hybrid")
+# stage4 retrieval 기본 모드다. 현재 평가는 dense child retrieval이 기본 baseline이다.
+STAGE4_RETRIEVAL_MODE = _read_text("STAGE4_RETRIEVAL_MODE", "dense")
 
 # hybrid 컬렉션의 named vector 이름이다. stage3 설정을 그대로 재사용한다.
 STAGE4_DENSE_VECTOR_NAME = _read_text(
@@ -153,6 +161,17 @@ STAGE4_RESTRICT_TO_DOCUMENT = _read_bool("STAGE4_RESTRICT_TO_DOCUMENT", True)
 # score threshold를 주고 싶을 때만 사용한다. 비어 있으면 전체 top-k를 그대로 받는다.
 STAGE4_SCORE_THRESHOLD = _read_optional_float("STAGE4_SCORE_THRESHOLD")
 
+# threshold를 적용했을 때 결과가 너무 적으면, threshold 없이 한 번 더 조회한다.
+STAGE4_ENABLE_SCORE_FALLBACK = _read_bool(
+    "STAGE4_ENABLE_SCORE_FALLBACK",
+    True,
+)
+
+# retrieval 후보가 많을 때 비슷한 sibling chunk를 줄이기 위한 MMR 설정이다.
+# 현재 기본 경로는 dense + window 이므로 MMR은 실험 옵션으로만 둔다.
+STAGE4_ENABLE_MMR = _read_bool("STAGE4_ENABLE_MMR", False)
+STAGE4_MMR_LAMBDA_MULT = _read_float("STAGE4_MMR_LAMBDA_MULT", 0.5)
+
 # BM25 query에 사용할 텍스트 처리 옵션이다.
 STAGE4_BM25_TOKENIZER = _read_text(
     "STAGE4_BM25_TOKENIZER",
@@ -172,3 +191,13 @@ STAGE4_BM25_EXCLUDED_ROLE_HINTS = _read_text_list(
     "STAGE4_BM25_EXCLUDED_ROLE_HINTS",
     ["reference_like", "front_matter_like", "title_only"],
 )
+
+# child chunk hit 이후 parent 문맥을 얼마나 확장해서 붙일지 결정한다.
+# child: child 본문만 유지
+# window: 같은 parent 안에서 앞뒤 sibling window만 확장
+# parent: parent 전체 본문으로 확장
+STAGE4_PARENT_EXPAND_MODE = _read_text(
+    "STAGE4_PARENT_EXPAND_MODE",
+    "window",
+)
+STAGE4_PARENT_WINDOW_SIZE = _read_int("STAGE4_PARENT_WINDOW_SIZE", 1)

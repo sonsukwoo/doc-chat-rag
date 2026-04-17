@@ -19,6 +19,7 @@ def build_document_filter(document_id: str) -> dict[str, object]:
 
 def build_bm25_filter(
     *,
+    bm25_vector_name: str,
     document_id: str | None = None,
     restrict_to_document: bool = True,
     excluded_role_hints: list[str] | None = None,
@@ -34,6 +35,13 @@ def build_bm25_filter(
                 "match": {"value": document_id},
             }
         )
+    must.append(
+        {
+            "key": "sparse_keep",
+            "match": {"value": True},
+        }
+    )
+    must.append({"has_vector": bm25_vector_name})
 
     for role_hint in excluded_role_hints or []:
         must_not.append(
@@ -125,6 +133,7 @@ def search_hybrid_chunks(
         "limit": bm25_fetch_k,
     }
     bm25_filter = build_bm25_filter(
+        bm25_vector_name=bm25_vector_name,
         document_id=document_id,
         restrict_to_document=restrict_to_document,
         excluded_role_hints=bm25_excluded_role_hints,

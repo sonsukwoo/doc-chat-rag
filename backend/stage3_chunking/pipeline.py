@@ -8,6 +8,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from backend.common import derive_document_id_from_artifact_path
+
 from .config import (
     DEFAULT_CHUNKS_MD_NAME,
     DEFAULT_CHUNKS_JSON_NAME,
@@ -21,6 +25,7 @@ from .config import (
     STAGE3_TEXT_TARGET_TOKENS,
 )
 from .embeddings import SemanticEmbeddingClient
+from .sparse_policy import determine_sparse_policy
 from .schemas import (
     ChunkPayload,
     ParentPayload,
@@ -50,6 +55,20 @@ YEAR_PATTERN = re.compile(r"\b(?:19|20)\d{2}\b")
 CITATION_BRACKET_PATTERN = re.compile(r"\[[0-9,\-\s]{1,20}\]")
 CITATION_PAREN_PATTERN = re.compile(r"\([^)]{0,80}\b(?:19|20)\d{2}\b[^)]{0,80}\)")
 SENTENCE_END_PATTERN = re.compile(r"[.!?。！？]\s*$")
+RECURSIVE_TEXT_SEPARATORS = [
+    "\n\n",
+    "\n",
+    ". ",
+    "! ",
+    "? ",
+    "。",
+    "！",
+    "？",
+    "; ",
+    ": ",
+    " ",
+    "",
+]
 
 
 @dataclass(frozen=True)
@@ -306,6 +325,9 @@ def _build_sparse_role_hints(
         "year_like_count": year_like_count,
         "citation_like_count": citation_like_count,
         "sentence_like_ratio": round(sentence_like_ratio, 4),
+        "early_page_hint": early_page_hint,
+        "tail_page_hint": tail_page_hint,
+        "average_line_tokens": round(average_line_tokens, 4),
         "sparse_role_hints": sparse_role_hints,
     }
 
@@ -322,8 +344,18 @@ def _annotate_sparse_filter_metadata(
             chunk,
             total_pages=total_pages,
         )
-        metadata.update(sparse_metadata)
-        chunk["metadata"] = metadata
+        merged_metadata = {
+            **metadata,
+            **sparse_metadata,
+        }
+        sparse_policy = determine_sparse_policy(
+            chunk_type=str(chunk.get("chunk_type") or ""),
+            body_text=str(chunk.get("text") or ""),
+            section_title=str(sparse_metadata.get("section_title") or "") or None,
+            metadata=merged_metadata,
+        )
+        merged_metadata.update(sparse_policy)
+        chunk["metadata"] = merged_metadata
     return chunks
 
 
@@ -466,6 +498,8 @@ def _take_tail_for_overlap(text: str, overlap_tokens: int) -> str:
     tail = normalized[-approximate_chars:]
     if "\n" in tail:
         tail = tail.split("\n", maxsplit=1)[-1]
+    elif " " in tail:
+        tail = tail.split(" ", maxsplit=1)[-1]
     return tail.strip()
 
 
@@ -489,6 +523,40 @@ def _split_text_to_sentence_segments(
             pages=[source["page"]],
         )
         for sentence in sentences
+    ]
+
+
+def _split_segment_with_recursive_text_splitter(
+    segment: TextSegment,
+) -> list[TextSegment]:
+    """단일 oversized segment를 LangChain recursive splitter로 보수적으로 분할한다."""
+    if _estimate_tokens(segment.text) <= STAGE3_TEXT_MAX_TOKENS:
+        return [segment]
+
+    splitter = RecursiveCharacterTextSplitter(
+        separators=RECURSIVE_TEXT_SEPARATORS,
+        keep_separator="end",
+        chunk_size=STAGE3_TEXT_TARGET_TOKENS,
+        chunk_overlap=0,
+        length_function=_estimate_tokens,
+        strip_whitespace=True,
+    )
+    split_texts = [
+        _normalize_text(part)
+        for part in splitter.split_text(segment.text)
+        if _normalize_text(part)
+    ]
+    if len(split_texts) <= 1:
+        return [segment]
+
+    return [
+        TextSegment(
+            text=part,
+            source_elements=list(segment.source_elements),
+            element_ids=list(segment.element_ids),
+            pages=list(segment.pages),
+        )
+        for part in split_texts
     ]
 
 
@@ -593,6 +661,11 @@ def _split_text_draft(
             draft.base_text,
             draft.source_elements[0],
         ) or segments
+
+    expanded_segments: list[TextSegment] = []
+    for segment in segments:
+        expanded_segments.extend(_split_segment_with_recursive_text_splitter(segment))
+    segments = expanded_segments or segments
 
     if len(segments) <= 1:
         draft.metadata["estimated_tokens"] = estimated_tokens
@@ -820,9 +893,11 @@ def _finalize_chunk_payloads(drafts: list[ChunkDraft]) -> list[ChunkPayload]:
                     previous_chunk.base_text,
                     STAGE3_TEXT_OVERLAP_TOKENS,
                 )
-            rendered_text = draft.base_text
+            if overlap_text:
+                rendered_text = f"{overlap_text}\n\n{draft.base_text}".strip()
+            else:
+                rendered_text = draft.base_text
             metadata["overlap_applied"] = bool(overlap_text)
-            metadata["overlap_text"] = overlap_text or None
             previous_text_by_heading[heading_key] = draft
 
         payloads.append(
@@ -863,13 +938,6 @@ def _build_stats(chunks: list[ChunkPayload]) -> Stage3ChunkStats:
             if chunk["metadata"].get("semantic_merge_applied")
         ),
     }
-
-
-def _derive_document_id(*, cleaned_json_path: Path) -> str:
-    """stage3 출력물 묶음을 식별할 문서 id를 폴더명 기준으로 만든다."""
-    if cleaned_json_path.parent.name in {"stage2", "review"}:
-        return cleaned_json_path.parent.parent.name
-    return cleaned_json_path.parent.name
 
 
 def _build_parent_payloads(
@@ -999,7 +1067,6 @@ def _render_chunk_preview_markdown(
         pages_label = ", ".join(str(page) for page in chunk.get("pages") or [])
         element_ids_label = ", ".join(str(element_id) for element_id in chunk.get("element_ids") or [])
         metadata = chunk.get("metadata") or {}
-        overlap_text = metadata.get("overlap_text") or ""
         caption_text = metadata.get("caption") or ""
         summary_text = metadata.get("summary_text") or ""
 
@@ -1038,17 +1105,6 @@ def _render_chunk_preview_markdown(
                     "",
                     "```text",
                     str(summary_text),
-                    "```",
-                    "",
-                ]
-            )
-        if overlap_text:
-            lines.extend(
-                [
-                    "### 이전 문맥",
-                    "",
-                    "```text",
-                    str(overlap_text),
                     "```",
                     "",
                 ]
@@ -1161,7 +1217,7 @@ def run_stage3_chunking(
         chunks,
         total_pages=total_pages,
     )
-    document_id = _derive_document_id(cleaned_json_path=cleaned_json_path)
+    document_id = derive_document_id_from_artifact_path(cleaned_json_path)
     chunks, parents = _build_parent_payloads(
         chunks,
         document_id=document_id,

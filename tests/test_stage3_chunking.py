@@ -160,6 +160,8 @@ class Stage3ChunkingTests(unittest.TestCase):
             self.assertIn("예시 표 요약", table_chunk["text"])
             self.assertNotIn("캡션:", table_chunk["text"])
             self.assertEqual(table_chunk["text"].count("Table 1. 예시 표"), 1)
+            self.assertTrue(table_chunk["metadata"]["sparse_keep"])
+            self.assertIn("Table 1. 예시 표", table_chunk["metadata"]["sparse_text"])
 
             figure_chunk = next(
                 chunk for chunk in chunks if chunk["chunk_type"] == "figure"
@@ -167,6 +169,7 @@ class Stage3ChunkingTests(unittest.TestCase):
             self.assertIn("Figure 1. 예시 흐름도", figure_chunk["text"])
             self.assertIn("서비스 흐름을 설명하는 도식이다.", figure_chunk["text"])
             self.assertNotIn("그림 요약:", figure_chunk["text"])
+            self.assertTrue(figure_chunk["metadata"]["sparse_keep"])
 
             preview_text = chunks_md_path.read_text()
             self.assertIn("## 1번 청크", preview_text)
@@ -239,6 +242,10 @@ class Stage3ChunkingTests(unittest.TestCase):
                     for chunk in text_chunks[1:]
                 )
             )
+            self.assertIn(
+                "청킹 테스트를 위한 예시 문장",
+                text_chunks[1]["text"],
+            )
 
     def test_page_continuation_prose_run_is_split_with_overlap(self):
         page1_text = " ".join(
@@ -305,6 +312,60 @@ class Stage3ChunkingTests(unittest.TestCase):
                     for chunk in text_chunks[1:]
                 )
             )
+            self.assertIn("첫 페이지 본문 문장", text_chunks[1]["text"])
+
+    def test_oversized_paragraph_without_sentence_breaks_uses_recursive_splitter(self):
+        long_text = " ".join(
+            f"긴청크분할테스트단어{index}"
+            for index in range(1, 700)
+        )
+        sample_payload = {
+            "elements": [
+                {
+                    "id": 1,
+                    "category": "heading",
+                    "page": 1,
+                    "order": 1,
+                    "text": "1. 분할 fallback",
+                    "html": "<h1>1. 분할 fallback</h1>",
+                },
+                {
+                    "id": 2,
+                    "category": "paragraph",
+                    "page": 1,
+                    "order": 2,
+                    "text": long_text,
+                },
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            cleaned_json_path = temp_path / "cleaned.json"
+            cleaned_json_path.write_text(
+                json.dumps(sample_payload, ensure_ascii=False, indent=2)
+            )
+
+            result = run_stage3_chunking(
+                {
+                    "cleaned_json_path": str(cleaned_json_path),
+                    "output_dir": str(temp_path),
+                },
+                embedding_client=_DisabledEmbeddingClient(),
+            )
+
+            stored = json.loads(Path(result["output_paths"]["chunks_json"]).read_text())
+            text_chunks = [
+                chunk for chunk in stored["chunks"] if chunk["chunk_type"] == "text"
+            ]
+            self.assertGreaterEqual(len(text_chunks), 2)
+            self.assertTrue(
+                all(
+                    chunk["metadata"]["estimated_tokens"] <= 900
+                    for chunk in text_chunks
+                )
+            )
+            self.assertTrue(text_chunks[1]["metadata"]["overlap_applied"])
 
     def test_sparse_role_hints_are_derived_conservatively(self):
         sample_payload = {
@@ -381,6 +442,7 @@ class Stage3ChunkingTests(unittest.TestCase):
                 front_matter_chunk["metadata"]["sparse_role_hints"],
             )
             self.assertTrue(front_matter_chunk["metadata"]["has_email"])
+            self.assertFalse(front_matter_chunk["metadata"]["sparse_keep"])
             self.assertIn(
                 "reference_like",
                 reference_chunk["metadata"]["sparse_role_hints"],
@@ -389,7 +451,11 @@ class Stage3ChunkingTests(unittest.TestCase):
                 reference_chunk["metadata"]["citation_like_count"],
                 1,
             )
+            self.assertFalse(reference_chunk["metadata"]["sparse_keep"])
             self.assertEqual(prose_chunk["metadata"]["sparse_role_hints"], [])
+            self.assertTrue(prose_chunk["metadata"]["sparse_keep"])
+            self.assertIn("1. 소개", prose_chunk["metadata"]["sparse_text"])
+            self.assertIn("검색 품질 개선 방법", prose_chunk["metadata"]["sparse_text"])
 
 
 if __name__ == "__main__":

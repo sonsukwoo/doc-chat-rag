@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
+from backend.common import derive_document_id_from_artifact_path
 from backend.stage3_chunking.embeddings import OpenAIEmbeddingClient
 
 from .config import (
@@ -63,27 +64,6 @@ def _load_chunks_document(chunks_json_path: Path) -> dict[str, Any]:
     return payload
 
 
-def _derive_document_id(
-    *,
-    chunks_json_path: Path,
-    chunks_document: dict[str, Any],
-    explicit_document_id: str | None,
-) -> str:
-    if explicit_document_id:
-        return explicit_document_id
-
-    cleaned_json_path = chunks_document.get("cleaned_json_path")
-    if cleaned_json_path:
-        resolved = Path(str(cleaned_json_path)).expanduser().resolve()
-        if resolved.parent.name in {"stage2", "review"}:
-            return resolved.parent.parent.name
-        return resolved.parent.name
-
-    if chunks_json_path.parent.name == "stage3":
-        return chunks_json_path.parent.parent.name
-    return chunks_json_path.parent.name
-
-
 def _iter_batches(items: list[Any], batch_size: int) -> Iterable[list[Any]]:
     for start_index in range(0, len(items), batch_size):
         yield items[start_index : start_index + batch_size]
@@ -92,6 +72,23 @@ def _iter_batches(items: list[Any], batch_size: int) -> Iterable[list[Any]]:
 def _get_chunk_text(chunk: dict[str, Any]) -> str:
     """chunk에서 인덱싱에 사용할 본문 텍스트를 정규화해 꺼낸다."""
     return str(chunk.get("text") or "").strip()
+
+
+def _get_sparse_text(chunk: dict[str, Any]) -> str:
+    """BM25 branch에 올릴 sparse 전용 텍스트를 읽는다."""
+    metadata = chunk.get("metadata") or {}
+    sparse_text = str(metadata.get("sparse_text") or "").strip()
+    if sparse_text:
+        return sparse_text
+    return _get_chunk_text(chunk)
+
+
+def _should_index_sparse(chunk: dict[str, Any]) -> bool:
+    """현재 청크를 sparse branch에 태울지 판단한다."""
+    metadata = chunk.get("metadata") or {}
+    if not bool(metadata.get("sparse_keep")):
+        return False
+    return bool(_get_sparse_text(chunk))
 
 
 def _select_indexable_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -163,6 +160,7 @@ def _build_qdrant_payload(
     ]
     if sparse_role_hints:
         payload["sparse_role_hints"] = sparse_role_hints
+    payload["sparse_keep"] = bool(metadata.get("sparse_keep"))
 
     if has_asset:
         payload["asset_kind"] = chunk_type
@@ -190,23 +188,23 @@ def _build_qdrant_points(
                 f"rag-chat:{document_id}:{chunk_id}",
             )
         )
-        text = _get_chunk_text(chunk)
-        bm25_document: dict[str, Any] = {
-            "text": text,
-            "model": "qdrant/bm25",
-            "options": {
-                "tokenizer": STAGE3_BM25_TOKENIZER,
-                "language": STAGE3_BM25_LANGUAGE,
-                "ascii_folding": STAGE3_BM25_ASCII_FOLDING,
-            },
+        vectors: dict[str, Any] = {
+            dense_vector_name: vector,
         }
+        if _should_index_sparse(chunk):
+            vectors[bm25_vector_name] = {
+                "text": _get_sparse_text(chunk),
+                "model": "qdrant/bm25",
+                "options": {
+                    "tokenizer": STAGE3_BM25_TOKENIZER,
+                    "language": STAGE3_BM25_LANGUAGE,
+                    "ascii_folding": STAGE3_BM25_ASCII_FOLDING,
+                },
+            }
         points.append(
             {
                 "id": point_id,
-                "vector": {
-                    dense_vector_name: vector,
-                    bm25_vector_name: bm25_document,
-                },
+                "vector": vectors,
                 "payload": _build_qdrant_payload(
                     document_id=document_id,
                     chunk=chunk,
@@ -214,6 +212,18 @@ def _build_qdrant_points(
             }
         )
     return points
+
+
+def _build_document_filter(document_id: str) -> dict[str, Any]:
+    """같은 document_id를 가진 기존 point를 삭제할 때 사용할 Qdrant filter."""
+    return {
+        "must": [
+            {
+                "key": "document_id",
+                "match": {"value": document_id},
+            }
+        ]
+    }
 
 
 def _write_index_manifest(
@@ -266,11 +276,14 @@ def run_stage3_indexing(
     chunks_document = _load_chunks_document(chunks_json_path)
     chunks = list(chunks_document.get("chunks") or [])
     indexable_chunks = _select_indexable_chunks(chunks)
-    document_id = _derive_document_id(
-        chunks_json_path=chunks_json_path,
-        chunks_document=chunks_document,
-        explicit_document_id=inputs.get("document_id"),
-    )
+    explicit_document_id = inputs.get("document_id")
+    if explicit_document_id:
+        document_id = explicit_document_id
+    else:
+        cleaned_json_path = chunks_document.get("cleaned_json_path")
+        document_id = derive_document_id_from_artifact_path(
+            cleaned_json_path or chunks_json_path
+        )
 
     if not indexing_enabled:
         output: Stage3IndexOutput = {
@@ -342,6 +355,11 @@ def run_stage3_indexing(
             dense_vector_name=dense_vector_name,
             bm25_vector_name=bm25_vector_name,
             distance="Cosine",
+        )
+        qdrant_client.delete_points_by_filter(
+            collection_name=collection_name,
+            query_filter=_build_document_filter(document_id),
+            wait=True,
         )
         for batch in _iter_batches(points, STAGE3_QDRANT_UPSERT_BATCH_SIZE):
             qdrant_client.upsert_points(

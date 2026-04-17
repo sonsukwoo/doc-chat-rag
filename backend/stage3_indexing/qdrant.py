@@ -217,6 +217,22 @@ class QdrantRestClient:
         response.raise_for_status()
         return response.json()
 
+    def delete_points_by_filter(
+        self,
+        *,
+        collection_name: str,
+        query_filter: dict[str, Any],
+        wait: bool = True,
+    ) -> dict[str, Any]:
+        """payload filter에 맞는 point를 삭제한다."""
+        response = self._client.post(
+            f"/collections/{collection_name}/points/delete",
+            params={"wait": str(wait).lower()},
+            json={"filter": query_filter},
+        )
+        response.raise_for_status()
+        return response.json()
+
     def query_points(
         self,
         *,

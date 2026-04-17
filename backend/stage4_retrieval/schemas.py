@@ -23,6 +23,11 @@ class Stage4Input(TypedDict, total=False):
     bm25_excluded_role_hints: list[str]
     restrict_to_document: bool
     score_threshold: float
+    enable_score_fallback: bool
+    enable_mmr: bool
+    mmr_lambda_mult: float
+    parent_expand_mode: str
+    parent_window_size: int
 
 
 class Stage4OutputPaths(TypedDict):
@@ -54,6 +59,9 @@ class RetrievedChunkPayload(TypedDict, total=False):
     parent_section_title: str | None
     parent_page_start: int | None
     parent_page_end: int | None
+    context_text: str | None
+    context_chunk_ids: list[str]
+    expansion_mode: str | None
 
 
 class Stage4Output(TypedDict, total=False):
@@ -72,6 +80,14 @@ class Stage4Output(TypedDict, total=False):
     bm25_fetch_k: int
     hybrid_rrf_weights: list[float] | None
     bm25_excluded_role_hints: list[str]
+    score_threshold_requested: float | None
+    score_threshold_applied: float | None
+    score_fallback_applied: bool
+    mmr_enabled: bool
+    mmr_applied: bool
+    mmr_lambda_mult: float
+    parent_expand_mode: str
+    parent_window_size: int
     chunk_count: int
     parent_count: int
     fetched_count: int

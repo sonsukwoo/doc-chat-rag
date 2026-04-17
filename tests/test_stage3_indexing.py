@@ -19,6 +19,7 @@ class _FakeEmbeddingClient:
 class _FakeQdrantClient:
     def __init__(self):
         self.collections = []
+        self.delete_calls = []
         self.upsert_batches = []
 
     def ensure_hybrid_collection(
@@ -51,6 +52,16 @@ class _FakeQdrantClient:
         )
         return {"status": "ok"}
 
+    def delete_points_by_filter(self, *, collection_name, query_filter, wait=True):
+        self.delete_calls.append(
+            {
+                "collection_name": collection_name,
+                "query_filter": query_filter,
+                "wait": wait,
+            }
+        )
+        return {"status": "ok"}
+
     def close(self):
         return None
 
@@ -74,6 +85,8 @@ class Stage3IndexingTests(unittest.TestCase):
                     "metadata": {
                         "group_type": "prose",
                         "sparse_role_hints": ["front_matter_like"],
+                        "sparse_keep": False,
+                        "sparse_text": "",
                     },
                 },
                 {
@@ -91,6 +104,8 @@ class Stage3IndexingTests(unittest.TestCase):
                         "caption": "Table 1. 예시 표",
                         "image_path": "tables/page_2_table_1.png",
                         "summary_text": "요약 텍스트",
+                        "sparse_keep": True,
+                        "sparse_text": "2. 실험 > 2.1 결과\n\nTable 1. 예시 표\n\n요약 텍스트",
                     },
                 },
             ],
@@ -129,6 +144,22 @@ class Stage3IndexingTests(unittest.TestCase):
             self.assertEqual(fake_qdrant.collections[0]["distance"], "Cosine")
             self.assertEqual(fake_qdrant.collections[0]["dense_vector_name"], "dense")
             self.assertEqual(fake_qdrant.collections[0]["bm25_vector_name"], "bm25")
+            self.assertEqual(len(fake_qdrant.delete_calls), 1)
+            self.assertEqual(
+                fake_qdrant.delete_calls[0]["collection_name"],
+                "rag_chat_test",
+            )
+            self.assertEqual(
+                fake_qdrant.delete_calls[0]["query_filter"],
+                {
+                    "must": [
+                        {
+                            "key": "document_id",
+                            "match": {"value": "doc-001"},
+                        }
+                    ]
+                },
+            )
             self.assertEqual(len(fake_qdrant.upsert_batches), 1)
             self.assertEqual(
                 fake_qdrant.upsert_batches[0]["collection_name"],
@@ -136,9 +167,6 @@ class Stage3IndexingTests(unittest.TestCase):
             )
             first_point = fake_qdrant.upsert_batches[0]["points"][0]
             self.assertIn("dense", first_point["vector"])
-            self.assertIn("bm25", first_point["vector"])
-            self.assertEqual(first_point["vector"]["bm25"]["model"], "qdrant/bm25")
-            self.assertEqual(first_point["vector"]["bm25"]["options"]["tokenizer"], "multilingual")
             self.assertEqual(first_point["payload"]["document_id"], "doc-001")
             self.assertEqual(first_point["payload"]["chunk_id"], "text-0001")
             self.assertEqual(first_point["payload"]["parent_id"], "parent-0001")
@@ -149,16 +177,20 @@ class Stage3IndexingTests(unittest.TestCase):
                 first_point["payload"]["sparse_role_hints"],
                 ["front_matter_like"],
             )
+            self.assertFalse(first_point["payload"]["sparse_keep"])
+            self.assertNotIn("bm25", first_point["vector"])
             self.assertNotIn("source_elements", first_point["payload"])
             self.assertNotIn("metadata", first_point["payload"])
 
             second_point = fake_qdrant.upsert_batches[0]["points"][1]
+            self.assertIn("bm25", second_point["vector"])
             self.assertEqual(second_point["payload"]["chunk_type"], "table")
             self.assertEqual(second_point["payload"]["section_title"], "2. 실험 > 2.1 결과")
             self.assertEqual(second_point["payload"]["primary_page"], 2)
             self.assertEqual(second_point["payload"]["page_start"], 2)
             self.assertEqual(second_point["payload"]["page_end"], 3)
             self.assertTrue(second_point["payload"]["has_asset"])
+            self.assertTrue(second_point["payload"]["sparse_keep"])
             self.assertEqual(second_point["payload"]["asset_kind"], "table")
             self.assertEqual(
                 second_point["payload"]["asset_relative_path"],
@@ -182,6 +214,10 @@ class Stage3IndexingTests(unittest.TestCase):
                     "chunk_type": "text",
                     "text": "실제 본문입니다.",
                     "pages": [1],
+                    "metadata": {
+                        "sparse_keep": True,
+                        "sparse_text": "실제 본문입니다.",
+                    },
                 },
             ],
         }
@@ -207,6 +243,7 @@ class Stage3IndexingTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "completed")
             self.assertEqual(result["point_count"], 1)
+            self.assertEqual(len(fake_qdrant.delete_calls), 1)
             self.assertEqual(len(fake_qdrant.upsert_batches), 1)
             self.assertEqual(len(fake_qdrant.upsert_batches[0]["points"]), 1)
             self.assertEqual(
