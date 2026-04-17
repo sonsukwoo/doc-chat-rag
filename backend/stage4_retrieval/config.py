@@ -172,6 +172,15 @@ STAGE4_ENABLE_SCORE_FALLBACK = _read_bool(
 STAGE4_ENABLE_MMR = _read_bool("STAGE4_ENABLE_MMR", False)
 STAGE4_MMR_LAMBDA_MULT = _read_float("STAGE4_MMR_LAMBDA_MULT", 0.5)
 
+# dense retrieval 뒤 relevance를 다시 정렬할 cross-encoder reranker 설정이다.
+# 기본값은 비활성화로 두고, 실험 결과가 쌓이면 기본 경로 승격 여부를 판단한다.
+STAGE4_ENABLE_RERANK = _read_bool("STAGE4_ENABLE_RERANK", False)
+STAGE4_RERANK_MODEL = _read_text(
+    "STAGE4_RERANK_MODEL",
+    "BAAI/bge-reranker-v2-m3",
+)
+STAGE4_RERANK_DEVICE = _read_text("STAGE4_RERANK_DEVICE", "cpu")
+
 # BM25 query에 사용할 텍스트 처리 옵션이다.
 STAGE4_BM25_TOKENIZER = _read_text(
     "STAGE4_BM25_TOKENIZER",

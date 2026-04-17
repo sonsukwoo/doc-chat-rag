@@ -115,6 +115,86 @@ def _build_sparse_text(
     return "\n\n".join(_dedupe_sparse_parts([section_title, preview]))
 
 
+def _build_sparse_policy_result(
+    *,
+    keep: bool,
+    sparse_text: str = "",
+    exclude_reason: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "sparse_keep": keep,
+        "sparse_text": sparse_text if keep else "",
+        "sparse_exclude_reason": None if keep else exclude_reason,
+    }
+
+
+def _evaluate_visual_sparse_policy(
+    *,
+    sparse_text: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    keep = bool(
+        sparse_text
+        and (
+            _normalize_text(metadata.get("caption"))
+            or _normalize_text(metadata.get("summary_text"))
+        )
+    )
+    return _build_sparse_policy_result(
+        keep=keep,
+        sparse_text=sparse_text,
+        exclude_reason="missing_visual_anchor",
+    )
+
+
+def _get_prose_sparse_exclude_reason(
+    *,
+    section_title: str | None,
+    metadata: dict[str, Any],
+    estimated_tokens: int,
+    sentence_like_ratio: float,
+    line_count: int,
+    average_line_tokens: float,
+    sparse_role_hints: list[str],
+    sparse_text: str,
+) -> str | None:
+    group_type = str(metadata.get("group_type") or "")
+
+    if sparse_role_hints:
+        return "role_hint_filtered"
+
+    if bool(metadata.get("has_email")) or bool(metadata.get("has_url")):
+        return "contact_or_url_metadata"
+
+    if group_type != "prose":
+        return "non_prose_text"
+
+    if estimated_tokens < SPARSE_MIN_TOKENS:
+        return "too_short_for_sparse"
+
+    if estimated_tokens < SPARSE_MIN_TOKENS_WITHOUT_SECTION and not section_title:
+        return "short_text_without_section_anchor"
+
+    if (
+        bool(metadata.get("early_page_hint"))
+        and line_count >= 3
+        and average_line_tokens <= SPARSE_EARLY_PAGE_META_MAX_LINE_TOKENS
+        and sentence_like_ratio < SPARSE_EARLY_PAGE_META_SENTENCE_RATIO
+    ):
+        return "early_page_meta_like"
+
+    if (
+        sentence_like_ratio < SPARSE_MIN_SENTENCE_RATIO_WITHOUT_SECTION
+        and not section_title
+    ):
+        return "low_sentence_density"
+
+    if not sparse_text:
+        return "empty_sparse_text"
+
+    return None
+
+
 def determine_sparse_policy(
     *,
     chunk_type: str,
@@ -123,7 +203,6 @@ def determine_sparse_policy(
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
     """실무형 보수 정책으로 BM25 branch에 태울 청크만 선별한다."""
-    group_type = str(metadata.get("group_type") or "")
     estimated_tokens = int(
         metadata.get("estimated_tokens") or _estimate_tokens(body_text)
     )
@@ -146,85 +225,23 @@ def determine_sparse_policy(
     )
 
     if chunk_type in VISUAL_CHUNK_TYPES:
-        keep = bool(
-            sparse_text
-            and (
-                _normalize_text(metadata.get("caption"))
-                or _normalize_text(metadata.get("summary_text"))
-            )
+        return _evaluate_visual_sparse_policy(
+            sparse_text=sparse_text,
+            metadata=metadata,
         )
-        return {
-            "sparse_keep": keep,
-            "sparse_text": sparse_text if keep else "",
-            "sparse_exclude_reason": None if keep else "missing_visual_anchor",
-        }
 
-    if sparse_role_hints:
-        return {
-            "sparse_keep": False,
-            "sparse_text": "",
-            "sparse_exclude_reason": "role_hint_filtered",
-        }
-
-    if bool(metadata.get("has_email")) or bool(metadata.get("has_url")):
-        return {
-            "sparse_keep": False,
-            "sparse_text": "",
-            "sparse_exclude_reason": "contact_or_url_metadata",
-        }
-
-    if group_type != "prose":
-        return {
-            "sparse_keep": False,
-            "sparse_text": "",
-            "sparse_exclude_reason": "non_prose_text",
-        }
-
-    if estimated_tokens < SPARSE_MIN_TOKENS:
-        return {
-            "sparse_keep": False,
-            "sparse_text": "",
-            "sparse_exclude_reason": "too_short_for_sparse",
-        }
-
-    if estimated_tokens < SPARSE_MIN_TOKENS_WITHOUT_SECTION and not section_title:
-        return {
-            "sparse_keep": False,
-            "sparse_text": "",
-            "sparse_exclude_reason": "short_text_without_section_anchor",
-        }
-
-    if (
-        bool(metadata.get("early_page_hint"))
-        and line_count >= 3
-        and average_line_tokens <= SPARSE_EARLY_PAGE_META_MAX_LINE_TOKENS
-        and sentence_like_ratio < SPARSE_EARLY_PAGE_META_SENTENCE_RATIO
-    ):
-        return {
-            "sparse_keep": False,
-            "sparse_text": "",
-            "sparse_exclude_reason": "early_page_meta_like",
-        }
-
-    if (
-        sentence_like_ratio < SPARSE_MIN_SENTENCE_RATIO_WITHOUT_SECTION
-        and not section_title
-    ):
-        return {
-            "sparse_keep": False,
-            "sparse_text": "",
-            "sparse_exclude_reason": "low_sentence_density",
-        }
-
-    if not sparse_text:
-        return {
-            "sparse_keep": False,
-            "sparse_text": "",
-            "sparse_exclude_reason": "empty_sparse_text",
-        }
-
-    return {
-        "sparse_keep": True,
-        "sparse_text": sparse_text,
-        "sparse_exclude_reason": None,
-    }
+    exclude_reason = _get_prose_sparse_exclude_reason(
+        section_title=section_title,
+        metadata=metadata,
+        estimated_tokens=estimated_tokens,
+        sentence_like_ratio=sentence_like_ratio,
+        line_count=line_count,
+        average_line_tokens=average_line_tokens,
+        sparse_role_hints=sparse_role_hints,
+        sparse_text=sparse_text,
+    )
+    return _build_sparse_policy_result(
+        keep=exclude_reason is None,
+        sparse_text=sparse_text,
+        exclude_reason=exclude_reason,
+    )

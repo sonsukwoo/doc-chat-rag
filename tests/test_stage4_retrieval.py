@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from backend.stage4_retrieval.pipeline import run_stage4_retrieval
 from backend.stage4_retrieval.retriever import QdrantChunkRetriever
@@ -103,6 +104,29 @@ class _MappedEmbeddingClient:
 
     def embed_texts(self, texts):
         return [list(self.mapping[text]) for text in texts]
+
+
+class _FakeCrossEncoderReranker:
+    def __init__(self, preferred_chunk_ids):
+        self.preferred_chunk_ids = list(preferred_chunk_ids)
+
+    def compress_documents(self, documents, query):
+        document_by_chunk_id = {
+            str(document.metadata.get("chunk_id") or ""): document
+            for document in documents
+        }
+        ordered = [
+            document_by_chunk_id[chunk_id]
+            for chunk_id in self.preferred_chunk_ids
+            if chunk_id in document_by_chunk_id
+        ]
+        ordered_chunk_ids = {id(document) for document in ordered}
+        ordered.extend(
+            document
+            for document in documents
+            if id(document) not in ordered_chunk_ids
+        )
+        return ordered
 
 
 class Stage4RetrievalTests(unittest.TestCase):
@@ -701,6 +725,180 @@ class Stage4RetrievalTests(unittest.TestCase):
             self.assertIn("이전 문맥입니다.", first_hit["context_text"])
             self.assertIn("핵심 본문입니다.", first_hit["context_text"])
             self.assertIn("다음 문맥입니다.", first_hit["context_text"])
+
+    def test_run_stage4_retrieval_applies_cross_encoder_rerank_before_window(self):
+        chunks_payload = {
+            "cleaned_json_path": "/tmp/sample/cleaned.json",
+            "chunks": [
+                {
+                    "chunk_id": "text-0001",
+                    "parent_id": "parent-0001",
+                    "chunk_type": "text",
+                    "text": "첫 번째 문맥입니다.",
+                },
+                {
+                    "chunk_id": "text-0002",
+                    "parent_id": "parent-0001",
+                    "chunk_type": "text",
+                    "text": "두 번째 핵심 본문입니다.",
+                },
+                {
+                    "chunk_id": "text-0003",
+                    "parent_id": "parent-0001",
+                    "chunk_type": "text",
+                    "text": "세 번째 보조 문맥입니다.",
+                },
+            ],
+        }
+        parents_payload = {
+            "document_id": "sample",
+            "parents": [
+                {
+                    "parent_id": "parent-0001",
+                    "section_title": "1. 소개",
+                    "page_start": 1,
+                    "page_end": 1,
+                    "child_chunk_ids": ["text-0001", "text-0002", "text-0003"],
+                }
+            ],
+        }
+
+        class _RerankFakeQdrantClient(_FakeQdrantClient):
+            def query_points(self, **kwargs):
+                self.calls.append(kwargs)
+                return [
+                    {
+                        "id": "point-1",
+                        "score": 0.95,
+                        "payload": {
+                            "document_id": "sample",
+                            "chunk_id": "text-0001",
+                            "parent_id": "parent-0001",
+                            "chunk_type": "text",
+                            "text": "첫 번째 문맥입니다.",
+                        },
+                    },
+                    {
+                        "id": "point-2",
+                        "score": 0.93,
+                        "payload": {
+                            "document_id": "sample",
+                            "chunk_id": "text-0002",
+                            "parent_id": "parent-0001",
+                            "chunk_type": "text",
+                            "text": "두 번째 핵심 본문입니다.",
+                        },
+                    },
+                    {
+                        "id": "point-3",
+                        "score": 0.90,
+                        "payload": {
+                            "document_id": "sample",
+                            "chunk_id": "text-0003",
+                            "parent_id": "parent-0001",
+                            "chunk_type": "text",
+                            "text": "세 번째 보조 문맥입니다.",
+                        },
+                    },
+                ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            chunks_json_path = temp_path / "chunks.json"
+            parents_json_path = temp_path / "parents.json"
+            chunks_json_path.write_text(
+                json.dumps(chunks_payload, ensure_ascii=False, indent=2)
+            )
+            parents_json_path.write_text(
+                json.dumps(parents_payload, ensure_ascii=False, indent=2)
+            )
+
+            with patch(
+                "backend.stage4_retrieval.rerank.get_huggingface_cross_encoder_reranker",
+                return_value=_FakeCrossEncoderReranker(
+                    ["text-0002", "text-0003", "text-0001"]
+                ),
+            ):
+                result = run_stage4_retrieval(
+                    {
+                        "query": "핵심 본문을 찾아줘",
+                        "chunks_json_path": str(chunks_json_path),
+                        "parents_json_path": str(parents_json_path),
+                        "output_dir": str(temp_path),
+                        "top_k": 2,
+                        "enable_rerank": True,
+                        "parent_expand_mode": "window",
+                        "parent_window_size": 1,
+                    },
+                    embedding_client=_FakeEmbeddingClient(),
+                    qdrant_client=_RerankFakeQdrantClient(),
+                )
+
+            self.assertEqual(result["status"], "completed")
+            self.assertTrue(result["rerank_enabled"])
+            self.assertTrue(result["rerank_applied"])
+            self.assertIsNone(result["rerank_error"])
+            self.assertEqual(result["retrieved_count"], 2)
+            self.assertEqual(
+                [item["chunk_id"] for item in result["retrievals"]],
+                ["text-0002", "text-0003"],
+            )
+            self.assertEqual(
+                result["retrievals"][0]["context_chunk_ids"],
+                ["text-0001", "text-0002", "text-0003"],
+            )
+            self.assertEqual(result["retrievals"][0]["expansion_mode"], "window")
+
+    def test_run_stage4_retrieval_keeps_dense_results_when_rerank_fails(self):
+        chunks_payload = {
+            "cleaned_json_path": "/tmp/sample/cleaned.json",
+            "chunks": [
+                {
+                    "chunk_id": "text-0001",
+                    "parent_id": "parent-0001",
+                    "chunk_type": "text",
+                    "text": "첫 번째 청크입니다.",
+                },
+                {
+                    "chunk_id": "text-0002",
+                    "parent_id": "parent-0001",
+                    "chunk_type": "text",
+                    "text": "두 번째 청크입니다.",
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            chunks_json_path = temp_path / "chunks.json"
+            chunks_json_path.write_text(
+                json.dumps(chunks_payload, ensure_ascii=False, indent=2)
+            )
+
+            with patch(
+                "backend.stage4_retrieval.rerank.get_huggingface_cross_encoder_reranker",
+                side_effect=RuntimeError("boom"),
+            ):
+                result = run_stage4_retrieval(
+                    {
+                        "query": "첫 번째 청크를 찾아줘",
+                        "chunks_json_path": str(chunks_json_path),
+                        "output_dir": str(temp_path),
+                        "top_k": 2,
+                        "enable_rerank": True,
+                    },
+                    embedding_client=_FakeEmbeddingClient(),
+                    qdrant_client=_FakeQdrantClient(),
+                )
+
+            self.assertEqual(result["status"], "completed")
+            self.assertTrue(result["rerank_enabled"])
+            self.assertFalse(result["rerank_applied"])
+            self.assertEqual(result["rerank_error"], "RuntimeError")
+            self.assertEqual(
+                [item["chunk_id"] for item in result["retrievals"]],
+                ["text-0001", "table-0001"],
+            )
 
 if __name__ == "__main__":
     unittest.main()

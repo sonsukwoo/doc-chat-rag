@@ -24,6 +24,9 @@ class Stage4Input(TypedDict, total=False):
     restrict_to_document: bool
     score_threshold: float
     enable_score_fallback: bool
+    enable_rerank: bool
+    rerank_model: str
+    rerank_device: str
     enable_mmr: bool
     mmr_lambda_mult: float
     parent_expand_mode: str
@@ -83,6 +86,11 @@ class Stage4Output(TypedDict, total=False):
     score_threshold_requested: float | None
     score_threshold_applied: float | None
     score_fallback_applied: bool
+    rerank_enabled: bool
+    rerank_applied: bool
+    rerank_model: str
+    rerank_device: str
+    rerank_error: str | None
     mmr_enabled: bool
     mmr_applied: bool
     mmr_lambda_mult: float

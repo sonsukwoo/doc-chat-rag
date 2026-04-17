@@ -24,6 +24,7 @@ from .config import (
     STAGE4_BM25_EXCLUDED_ROLE_HINTS,
     STAGE4_DENSE_VECTOR_NAME,
     STAGE4_ENABLE_MMR,
+    STAGE4_ENABLE_RERANK,
     STAGE4_ENABLE_SCORE_FALLBACK,
     STAGE4_FETCH_K,
     STAGE4_HYBRID_BM25_FETCH_K,
@@ -36,6 +37,8 @@ from .config import (
     STAGE4_QDRANT_API_KEY,
     STAGE4_QDRANT_TIMEOUT,
     STAGE4_QDRANT_URL,
+    STAGE4_RERANK_DEVICE,
+    STAGE4_RERANK_MODEL,
     STAGE4_RETRIEVAL_MODE,
     STAGE4_RESTRICT_TO_DOCUMENT,
     STAGE4_SCORE_THRESHOLD,
@@ -45,6 +48,7 @@ from .context import build_chunk_lookup, build_context_expander
 from .parents import load_parent_lookup
 from .postprocess import build_mmr_reranker
 from .retriever import build_qdrant_chunk_retriever
+from .rerank import build_cross_encoder_reranker
 from .schemas import Stage4Input, Stage4Output, Stage4OutputPaths
 
 
@@ -228,6 +232,8 @@ def _build_retrieval_normalizer(
         )
         return {
             **normalized,
+            "rerank_applied": bool(payload.get("rerank_applied")),
+            "rerank_error": payload.get("rerank_error"),
             "mmr_applied": bool(payload.get("mmr_applied")),
         }
 
@@ -281,6 +287,197 @@ def _build_retriever(
         document_id=document_id,
         restrict_to_document=restrict_to_document,
         score_threshold=score_threshold,
+    )
+
+
+def _build_base_output(
+    *,
+    query: str,
+    chunks_json_path: Path,
+    parents_json_path: Path | None,
+    output_dir: Path,
+    output_paths: Stage4OutputPaths,
+    document_id: str,
+    collection_name: str,
+    retrieval_mode: str,
+    top_k: int,
+    effective_fetch_k: int,
+    dense_fetch_k: int,
+    bm25_fetch_k: int,
+    hybrid_rrf_weights: list[float] | None,
+    bm25_excluded_role_hints: list[str],
+    score_threshold: float | None,
+    enable_rerank: bool,
+    rerank_model: str,
+    rerank_device: str,
+    enable_mmr: bool,
+    mmr_lambda_mult: float,
+    parent_expand_mode: str,
+    parent_window_size: int,
+    chunks_document: dict[str, Any],
+    parents_document: dict[str, Any],
+    qdrant_configured: bool,
+    restrict_to_document: bool,
+) -> Stage4Output:
+    return {
+        "query": query,
+        "chunks_json_path": str(chunks_json_path),
+        "parents_json_path": (
+            str(parents_json_path) if parents_json_path is not None else None
+        ),
+        "output_dir": str(output_dir),
+        "document_id": document_id,
+        "collection_name": collection_name,
+        "retrieval_mode": retrieval_mode,
+        "top_k": top_k,
+        "fetch_k": effective_fetch_k,
+        "dense_fetch_k": max(top_k, dense_fetch_k),
+        "bm25_fetch_k": max(top_k, bm25_fetch_k),
+        "hybrid_rrf_weights": hybrid_rrf_weights,
+        "bm25_excluded_role_hints": bm25_excluded_role_hints,
+        "score_threshold_requested": score_threshold,
+        "score_threshold_applied": score_threshold,
+        "score_fallback_applied": False,
+        "rerank_enabled": enable_rerank,
+        "rerank_applied": False,
+        "rerank_model": rerank_model,
+        "rerank_device": rerank_device,
+        "rerank_error": None,
+        "mmr_enabled": enable_mmr,
+        "mmr_applied": False,
+        "mmr_lambda_mult": mmr_lambda_mult,
+        "parent_expand_mode": parent_expand_mode,
+        "parent_window_size": parent_window_size,
+        "chunk_count": len(list(chunks_document.get("chunks") or [])),
+        "parent_count": len(list(parents_document.get("parents") or [])),
+        "fetched_count": 0,
+        "retrieved_count": 0,
+        "qdrant_configured": qdrant_configured,
+        "document_filter_applied": bool(restrict_to_document and document_id),
+        "retrievals": [],
+        "output_paths": output_paths,
+        "planned_outputs": output_paths,
+    }
+
+
+def _retrieve_documents_with_optional_score_fallback(
+    *,
+    embedding_client: OpenAIEmbeddingClient,
+    qdrant_client: QdrantRestClient,
+    collection_name: str,
+    retrieval_mode: str,
+    top_k: int,
+    effective_fetch_k: int,
+    dense_fetch_k: int,
+    bm25_fetch_k: int,
+    hybrid_rrf_weights: list[float] | None,
+    bm25_excluded_role_hints: list[str],
+    document_id: str,
+    restrict_to_document: bool,
+    query: str,
+    score_threshold: float | None,
+    enable_score_fallback: bool,
+) -> tuple[list[Document], bool, float | None]:
+    retriever = _build_retriever(
+        embedding_client=embedding_client,
+        qdrant_client=qdrant_client,
+        collection_name=collection_name,
+        retrieval_mode=retrieval_mode,
+        top_k=top_k,
+        effective_fetch_k=effective_fetch_k,
+        dense_fetch_k=dense_fetch_k,
+        bm25_fetch_k=bm25_fetch_k,
+        hybrid_rrf_weights=hybrid_rrf_weights,
+        bm25_excluded_role_hints=bm25_excluded_role_hints,
+        document_id=document_id,
+        restrict_to_document=restrict_to_document,
+        score_threshold=score_threshold,
+    )
+    retrieved_documents = list(retriever.invoke(query))
+    threshold_fallback_applied = False
+    effective_score_threshold = score_threshold
+
+    if (
+        effective_score_threshold is not None
+        and enable_score_fallback
+        and len(retrieved_documents) < top_k
+    ):
+        fallback_retriever = _build_retriever(
+            embedding_client=embedding_client,
+            qdrant_client=qdrant_client,
+            collection_name=collection_name,
+            retrieval_mode=retrieval_mode,
+            top_k=top_k,
+            effective_fetch_k=effective_fetch_k,
+            dense_fetch_k=dense_fetch_k,
+            bm25_fetch_k=bm25_fetch_k,
+            hybrid_rrf_weights=hybrid_rrf_weights,
+            bm25_excluded_role_hints=bm25_excluded_role_hints,
+            document_id=document_id,
+            restrict_to_document=restrict_to_document,
+            score_threshold=None,
+        )
+        retrieved_documents = list(fallback_retriever.invoke(query))
+        threshold_fallback_applied = True
+        effective_score_threshold = None
+
+    return (
+        retrieved_documents,
+        threshold_fallback_applied,
+        effective_score_threshold,
+    )
+
+
+def _build_document_processing_pipeline(
+    *,
+    query: str,
+    top_k: int,
+    rerank_enabled: bool,
+    rerank_model: str,
+    rerank_device: str,
+    enable_mmr: bool,
+    mmr_lambda_mult: float,
+    embedding_client: OpenAIEmbeddingClient,
+    chunk_lookup: dict[str, dict[str, Any]],
+    parent_lookup: dict[str, dict[str, Any]],
+    parent_expand_mode: str,
+    parent_window_size: int,
+    document_id: str,
+) -> Any:
+    return (
+        RunnableLambda(
+            lambda documents: {
+                "documents": list(documents),
+                "rerank_applied": False,
+                "rerank_error": None,
+                "mmr_applied": False,
+            }
+        )
+        | build_cross_encoder_reranker(
+            query=query,
+            enabled=rerank_enabled,
+            model_name=rerank_model,
+            top_n=top_k,
+            device=rerank_device,
+        )
+        | build_mmr_reranker(
+            query=query,
+            embedding_client=embedding_client,
+            top_k=top_k,
+            enabled=enable_mmr,
+            lambda_mult=mmr_lambda_mult,
+        )
+        | build_context_expander(
+            chunk_lookup=chunk_lookup,
+            parent_lookup=parent_lookup,
+            expand_mode=parent_expand_mode,
+            window_size=parent_window_size,
+        )
+        | _build_retrieval_normalizer(
+            top_k=top_k,
+            document_id=document_id,
+            parent_lookup=parent_lookup,
+        )
     )
 
 
@@ -366,6 +563,15 @@ def run_stage4_retrieval(
     enable_score_fallback = bool(
         resolved_inputs.get("enable_score_fallback", STAGE4_ENABLE_SCORE_FALLBACK)
     )
+    enable_rerank = bool(
+        resolved_inputs.get("enable_rerank", STAGE4_ENABLE_RERANK)
+    )
+    rerank_model = str(
+        resolved_inputs.get("rerank_model") or STAGE4_RERANK_MODEL
+    ).strip() or STAGE4_RERANK_MODEL
+    rerank_device = str(
+        resolved_inputs.get("rerank_device") or STAGE4_RERANK_DEVICE
+    ).strip() or STAGE4_RERANK_DEVICE
     enable_mmr = bool(resolved_inputs.get("enable_mmr", STAGE4_ENABLE_MMR))
     mmr_lambda_mult = float(
         resolved_inputs.get("mmr_lambda_mult", STAGE4_MMR_LAMBDA_MULT)
@@ -381,48 +587,37 @@ def run_stage4_retrieval(
         (qdrant_client is not None or STAGE4_QDRANT_URL) and collection_name
     )
 
-    base_output: Stage4Output = {
-        "query": query,
-        "chunks_json_path": str(chunks_json_path),
-        "parents_json_path": (
-            str(parents_json_path) if parents_json_path is not None else None
-        ),
-        "output_dir": str(output_dir),
-        "document_id": document_id,
-        "collection_name": collection_name,
-        "retrieval_mode": retrieval_mode,
-        "top_k": top_k,
-        "fetch_k": effective_fetch_k,
-        "dense_fetch_k": max(top_k, dense_fetch_k),
-        "bm25_fetch_k": max(top_k, bm25_fetch_k),
-        "hybrid_rrf_weights": hybrid_rrf_weights,
-        "bm25_excluded_role_hints": bm25_excluded_role_hints,
-        "score_threshold_requested": (
-            float(score_threshold)
-            if score_threshold is not None
-            else None
-        ),
-        "score_threshold_applied": (
-            float(score_threshold)
-            if score_threshold is not None
-            else None
-        ),
-        "score_fallback_applied": False,
-        "mmr_enabled": enable_mmr,
-        "mmr_applied": False,
-        "mmr_lambda_mult": mmr_lambda_mult,
-        "parent_expand_mode": parent_expand_mode,
-        "parent_window_size": parent_window_size,
-        "chunk_count": len(list(chunks_document.get("chunks") or [])),
-        "parent_count": len(list(parents_document.get("parents") or [])),
-        "fetched_count": 0,
-        "retrieved_count": 0,
-        "qdrant_configured": qdrant_configured,
-        "document_filter_applied": bool(restrict_to_document and document_id),
-        "retrievals": [],
-        "output_paths": output_paths,
-        "planned_outputs": output_paths,
-    }
+    resolved_score_threshold = (
+        float(score_threshold) if score_threshold is not None else None
+    )
+    base_output = _build_base_output(
+        query=query,
+        chunks_json_path=chunks_json_path,
+        parents_json_path=parents_json_path,
+        output_dir=output_dir,
+        output_paths=output_paths,
+        document_id=document_id,
+        collection_name=collection_name,
+        retrieval_mode=retrieval_mode,
+        top_k=top_k,
+        effective_fetch_k=effective_fetch_k,
+        dense_fetch_k=dense_fetch_k,
+        bm25_fetch_k=bm25_fetch_k,
+        hybrid_rrf_weights=hybrid_rrf_weights,
+        bm25_excluded_role_hints=bm25_excluded_role_hints,
+        score_threshold=resolved_score_threshold,
+        enable_rerank=enable_rerank,
+        rerank_model=rerank_model,
+        rerank_device=rerank_device,
+        enable_mmr=enable_mmr,
+        mmr_lambda_mult=mmr_lambda_mult,
+        parent_expand_mode=parent_expand_mode,
+        parent_window_size=parent_window_size,
+        chunks_document=chunks_document,
+        parents_document=parents_document,
+        qdrant_configured=qdrant_configured,
+        restrict_to_document=restrict_to_document,
+    )
 
     if not query:
         output: Stage4Output = {
@@ -456,7 +651,11 @@ def run_stage4_retrieval(
         created_qdrant_client = True
 
     try:
-        retriever = _build_retriever(
+        (
+            retrieved_documents,
+            threshold_fallback_applied,
+            effective_score_threshold,
+        ) = _retrieve_documents_with_optional_score_fallback(
             embedding_client=embedding_client,
             qdrant_client=qdrant_client,
             collection_name=collection_name,
@@ -469,63 +668,24 @@ def run_stage4_retrieval(
             bm25_excluded_role_hints=bm25_excluded_role_hints,
             document_id=document_id,
             restrict_to_document=restrict_to_document,
-            score_threshold=float(score_threshold) if score_threshold is not None else None,
+            query=query,
+            score_threshold=resolved_score_threshold,
+            enable_score_fallback=enable_score_fallback,
         )
-        retrieved_documents = list(retriever.invoke(query))
-        threshold_fallback_applied = False
-        effective_score_threshold = (
-            float(score_threshold) if score_threshold is not None else None
-        )
-
-        if (
-            effective_score_threshold is not None
-            and enable_score_fallback
-            and len(retrieved_documents) < top_k
-        ):
-            fallback_retriever = _build_retriever(
-                embedding_client=embedding_client,
-                qdrant_client=qdrant_client,
-                collection_name=collection_name,
-                retrieval_mode=retrieval_mode,
-                top_k=top_k,
-                effective_fetch_k=effective_fetch_k,
-                dense_fetch_k=dense_fetch_k,
-                bm25_fetch_k=bm25_fetch_k,
-                hybrid_rrf_weights=hybrid_rrf_weights,
-                bm25_excluded_role_hints=bm25_excluded_role_hints,
-                document_id=document_id,
-                restrict_to_document=restrict_to_document,
-                score_threshold=None,
-            )
-            retrieved_documents = list(fallback_retriever.invoke(query))
-            threshold_fallback_applied = True
-            effective_score_threshold = None
-
-        document_pipeline = (
-            RunnableLambda(
-                lambda documents: {
-                    "documents": list(documents),
-                    "mmr_applied": False,
-                }
-            )
-            | build_mmr_reranker(
-                query=query,
-                embedding_client=embedding_client,
-                top_k=top_k,
-                enabled=enable_mmr,
-                lambda_mult=mmr_lambda_mult,
-            )
-            | build_context_expander(
-                chunk_lookup=chunk_lookup,
-                parent_lookup=parent_lookup,
-                expand_mode=parent_expand_mode,
-                window_size=parent_window_size,
-            )
-            | _build_retrieval_normalizer(
-                top_k=top_k,
-                document_id=document_id,
-                parent_lookup=parent_lookup,
-            )
+        document_pipeline = _build_document_processing_pipeline(
+            query=query,
+            top_k=top_k,
+            rerank_enabled=enable_rerank,
+            rerank_model=rerank_model,
+            rerank_device=rerank_device,
+            enable_mmr=enable_mmr,
+            mmr_lambda_mult=mmr_lambda_mult,
+            embedding_client=embedding_client,
+            chunk_lookup=chunk_lookup,
+            parent_lookup=parent_lookup,
+            parent_expand_mode=parent_expand_mode,
+            parent_window_size=parent_window_size,
+            document_id=document_id,
         )
         retrieval_result = document_pipeline.invoke(retrieved_documents)
     finally:
@@ -536,6 +696,8 @@ def run_stage4_retrieval(
         **base_output,
         "score_threshold_applied": effective_score_threshold,
         "score_fallback_applied": threshold_fallback_applied,
+        "rerank_applied": bool(retrieval_result["rerank_applied"]),
+        "rerank_error": retrieval_result["rerank_error"],
         "mmr_applied": bool(retrieval_result["mmr_applied"]),
         "fetched_count": int(retrieval_result["fetched_count"]),
         "retrieved_count": int(retrieval_result["retrieved_count"]),
@@ -546,6 +708,8 @@ def run_stage4_retrieval(
     if persist_manifest:
         _write_retrieval_manifest(output, output_paths=output_paths)
     return output
+
+
 def main() -> None:
     """기본 chunks.json 경로를 기준으로 stage4 retrieval 결과를 출력한다."""
     response = run_stage4_retrieval(
