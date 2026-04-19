@@ -11,6 +11,7 @@ class Stage3IndexInput(TypedDict, total=False):
     chunks_json_path: str
     output_dir: str
     document_id: str
+    room_id: str
     collection_name: str
 
 
@@ -26,6 +27,7 @@ class Stage3IndexOutput(TypedDict, total=False):
     chunks_json_path: str
     output_dir: str
     document_id: str
+    room_id: str | None
     collection_name: str
     output_paths: Stage3IndexOutputPaths
     planned_outputs: Stage3IndexOutputPaths

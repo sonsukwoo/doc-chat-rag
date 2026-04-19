@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
+from backend.app_db import sync_document_runtime_metadata
 from backend.document_store import (
     build_document_paths,
     get_effective_cleaned_json_path,
+    load_document_record,
     update_document_stage_record,
 )
 from backend.stage1_parse.pipeline import run_stage1_parse
@@ -88,10 +91,12 @@ def run_stage2_for_document(document_id: str) -> dict[str, Any]:
 def run_stage3_for_document(
     document_id: str,
     *,
+    room_id: str | None = None,
     collection_name: str | None = None,
 ) -> dict[str, Any]:
     """review overlay가 있으면 이를 우선 사용해 chunking/indexing을 수행한다."""
     paths = build_document_paths(document_id)
+    document_record = load_document_record(document_id)
     cleaned_json_path = get_effective_cleaned_json_path(paths)
     update_document_stage_record(
         document_id=document_id,
@@ -104,6 +109,7 @@ def run_stage3_for_document(
                 "cleaned_json_path": str(cleaned_json_path),
                 "output_dir": str(paths.stage3_dir),
                 "document_id": document_id,
+                "room_id": room_id,
                 "collection_name": collection_name,
             }
         )
@@ -125,6 +131,19 @@ def run_stage3_for_document(
             status="completed",
             outputs=outputs,
         )
+        if room_id:
+            parents_payload = json.loads(paths.stage3_parents_json.read_text())
+            chunks_payload = json.loads(paths.stage3_chunks_json.read_text())
+            sync_document_runtime_metadata(
+                room_id=room_id,
+                document_id=document_id,
+                original_filename=str(document_record.get("original_filename") or f"{document_id}.pdf"),
+                normalized_filename=f"{document_id}.pdf",
+                storage_root=paths.root,
+                source_pdf_path=str(paths.source_pdf) if paths.source_pdf.exists() else None,
+                parents=list(parents_payload.get("parents") or []),
+                chunks=list(chunks_payload.get("chunks") or []),
+            )
         return result
     except Exception as exc:
         update_document_stage_record(

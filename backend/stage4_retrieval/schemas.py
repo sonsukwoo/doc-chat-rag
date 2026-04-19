@@ -13,6 +13,8 @@ class Stage4Input(TypedDict, total=False):
     parents_json_path: str
     output_dir: str
     document_id: str
+    room_id: str
+    active_document_ids: list[str]
     collection_name: str
     retrieval_mode: str
     top_k: int
@@ -75,6 +77,8 @@ class Stage4Output(TypedDict, total=False):
     parents_json_path: str | None
     output_dir: str
     document_id: str
+    room_id: str | None
+    active_document_ids: list[str]
     collection_name: str
     retrieval_mode: str
     top_k: int
@@ -101,6 +105,7 @@ class Stage4Output(TypedDict, total=False):
     fetched_count: int
     retrieved_count: int
     qdrant_configured: bool
+    room_filter_applied: bool
     document_filter_applied: bool
     retrievals: list[RetrievedChunkPayload]
     output_paths: Stage4OutputPaths

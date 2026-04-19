@@ -95,7 +95,9 @@ class QdrantChunkRetriever(BaseRetriever):
     bm25_options: dict[str, object]
     rrf_weights: list[float] | None = None
     bm25_excluded_role_hints: list[str] | None = None
+    room_id: str | None = None
     document_id: str | None = None
+    active_document_ids: list[str] | None = None
     restrict_to_document: bool = True
     score_threshold: float | None = None
 
@@ -124,7 +126,9 @@ class QdrantChunkRetriever(BaseRetriever):
                 query_vector=query_vector,
                 top_k=max(self.fetch_limit, self.dense_fetch_k),
                 dense_vector_name=self.dense_vector_name,
+                room_id=self.room_id,
                 document_id=self.document_id,
+                active_document_ids=self.active_document_ids,
                 restrict_to_document=self.restrict_to_document,
                 score_threshold=self.score_threshold,
             )
@@ -142,7 +146,9 @@ class QdrantChunkRetriever(BaseRetriever):
                 bm25_options=self.bm25_options,
                 rrf_weights=self.rrf_weights,
                 bm25_excluded_role_hints=self.bm25_excluded_role_hints,
+                room_id=self.room_id,
                 document_id=self.document_id,
+                active_document_ids=self.active_document_ids,
                 restrict_to_document=self.restrict_to_document,
                 score_threshold=self.score_threshold,
             )
@@ -170,7 +176,9 @@ def build_qdrant_chunk_retriever(
     bm25_options: dict[str, object],
     rrf_weights: list[float] | None,
     bm25_excluded_role_hints: list[str] | None,
+    room_id: str | None,
     document_id: str | None,
+    active_document_ids: list[str] | None,
     restrict_to_document: bool,
     score_threshold: float | None,
 ) -> QdrantChunkRetriever:
@@ -188,7 +196,9 @@ def build_qdrant_chunk_retriever(
         bm25_options=bm25_options,
         rrf_weights=rrf_weights,
         bm25_excluded_role_hints=bm25_excluded_role_hints,
+        room_id=room_id,
         document_id=document_id,
+        active_document_ids=active_document_ids,
         restrict_to_document=restrict_to_document,
         score_threshold=score_threshold,
     )

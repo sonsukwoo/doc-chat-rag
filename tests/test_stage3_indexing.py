@@ -124,6 +124,7 @@ class Stage3IndexingTests(unittest.TestCase):
                     "chunks_json_path": str(chunks_json_path),
                     "output_dir": str(temp_path),
                     "document_id": "doc-001",
+                    "room_id": "room-alpha",
                     "collection_name": "rag_chat_test",
                 },
                 embedding_client=_FakeEmbeddingClient(),
@@ -136,6 +137,7 @@ class Stage3IndexingTests(unittest.TestCase):
             self.assertTrue(result["indexing_enabled"])
             self.assertEqual(result["point_count"], 2)
             self.assertEqual(result["vector_size"], 3)
+            self.assertEqual(result["room_id"], "room-alpha")
             self.assertEqual(result["indexing_mode"], "hybrid")
             self.assertEqual(result["dense_vector_name"], "dense")
             self.assertEqual(result["bm25_vector_name"], "bm25")
@@ -154,6 +156,10 @@ class Stage3IndexingTests(unittest.TestCase):
                 {
                     "must": [
                         {
+                            "key": "room_id",
+                            "match": {"value": "room-alpha"},
+                        },
+                        {
                             "key": "document_id",
                             "match": {"value": "doc-001"},
                         }
@@ -167,6 +173,7 @@ class Stage3IndexingTests(unittest.TestCase):
             )
             first_point = fake_qdrant.upsert_batches[0]["points"][0]
             self.assertIn("dense", first_point["vector"])
+            self.assertEqual(first_point["payload"]["room_id"], "room-alpha")
             self.assertEqual(first_point["payload"]["document_id"], "doc-001")
             self.assertEqual(first_point["payload"]["chunk_id"], "text-0001")
             self.assertEqual(first_point["payload"]["parent_id"], "parent-0001")
@@ -249,6 +256,10 @@ class Stage3IndexingTests(unittest.TestCase):
             self.assertEqual(
                 fake_qdrant.upsert_batches[0]["points"][0]["payload"]["chunk_id"],
                 "text-0002",
+            )
+            self.assertNotIn(
+                "room_id",
+                fake_qdrant.upsert_batches[0]["points"][0]["payload"],
             )
             self.assertIn(
                 "bm25",

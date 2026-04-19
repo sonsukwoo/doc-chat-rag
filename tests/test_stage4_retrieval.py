@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from backend.stage4_retrieval.pipeline import run_stage4_retrieval
 from backend.stage4_retrieval.retriever import QdrantChunkRetriever
+from backend.stage4_retrieval.service import search_room_knowledge
 
 
 class _FakeEmbeddingClient:
@@ -236,6 +237,17 @@ class Stage4RetrievalTests(unittest.TestCase):
             self.assertTrue(result["document_filter_applied"])
             self.assertEqual(len(fake_qdrant.calls), 1)
             self.assertEqual(fake_qdrant.calls[0]["using"], "dense")
+            self.assertEqual(
+                fake_qdrant.calls[0]["query_filter"],
+                {
+                    "must": [
+                        {
+                            "key": "document_id",
+                            "match": {"value": "sample"},
+                        }
+                    ]
+                },
+            )
             self.assertFalse(manifest_path.exists())
             self.assertEqual(
                 Path(result["parents_json_path"]).resolve(),
@@ -260,6 +272,99 @@ class Stage4RetrievalTests(unittest.TestCase):
             self.assertEqual(second_hit["caption"], "Table 1. 예시 표")
             self.assertEqual(first_hit["dense_score"], 0.91)
             self.assertIsNone(first_hit["bm25_score"])
+
+    def test_qdrant_chunk_retriever_applies_room_and_active_document_filters(self):
+        fake_qdrant = _FakeQdrantClient()
+        retriever = QdrantChunkRetriever(
+            embedding_client=_FakeEmbeddingClient(),
+            qdrant_client=fake_qdrant,
+            collection_name="rag_chat_hybrid",
+            retrieval_mode="dense",
+            fetch_limit=4,
+            dense_fetch_k=4,
+            bm25_fetch_k=4,
+            bm25_options={
+                "tokenizer": "multilingual",
+                "language": "none",
+                "ascii_folding": False,
+            },
+            room_id="room-alpha",
+            active_document_ids=["doc-1", "doc-2"],
+            restrict_to_document=True,
+        )
+
+        retriever.invoke("표 관련 내용을 찾아줘")
+
+        self.assertEqual(
+            fake_qdrant.calls[0]["query_filter"],
+            {
+                "must": [
+                    {
+                        "key": "room_id",
+                        "match": {"value": "room-alpha"},
+                    },
+                    {
+                        "key": "document_id",
+                        "match": {"any": ["doc-1", "doc-2"]},
+                    },
+                ]
+            },
+        )
+
+    def test_run_stage4_retrieval_marks_room_filter_when_room_scope_is_given(self):
+        chunks_payload = {
+            "cleaned_json_path": "/tmp/sample/cleaned.json",
+            "chunks": [
+                {
+                    "chunk_id": "text-0001",
+                    "parent_id": "parent-0001",
+                    "chunk_type": "text",
+                    "text": "첫 번째 청크입니다.",
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            chunks_json_path = temp_path / "chunks.json"
+            chunks_json_path.write_text(
+                json.dumps(chunks_payload, ensure_ascii=False, indent=2)
+            )
+
+            fake_qdrant = _FakeQdrantClient()
+            result = run_stage4_retrieval(
+                {
+                    "query": "첫 번째 청크를 찾아줘",
+                    "chunks_json_path": str(chunks_json_path),
+                    "output_dir": str(temp_path),
+                    "room_id": "room-alpha",
+                    "active_document_ids": ["sample", "sample-2"],
+                    "retrieval_mode": "dense",
+                },
+                embedding_client=_FakeEmbeddingClient(),
+                qdrant_client=fake_qdrant,
+            )
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["room_id"], "room-alpha")
+            self.assertEqual(result["active_document_ids"], ["sample", "sample-2"])
+            self.assertTrue(result["room_filter_applied"])
+            self.assertTrue(result["document_filter_applied"])
+            self.assertEqual(
+                fake_qdrant.calls[0]["query_filter"],
+                {
+                    "must": [
+                        {
+                            "key": "room_id",
+                            "match": {"value": "room-alpha"},
+                        },
+                        {
+                            "key": "document_id",
+                            "match": {"any": ["sample", "sample-2"]},
+                        },
+                    ]
+                },
+            )
 
     def test_run_stage4_retrieval_hybrid_smoke(self):
         chunks_payload = {
@@ -501,6 +606,41 @@ class Stage4RetrievalTests(unittest.TestCase):
             self.assertEqual(len(fake_qdrant.calls), 2)
             self.assertEqual(fake_qdrant.calls[0]["score_threshold"], 0.9)
             self.assertIsNone(fake_qdrant.calls[1]["score_threshold"])
+
+    def test_search_room_knowledge_returns_room_scoped_hits(self):
+        fake_qdrant = _FakeQdrantClient()
+        result = search_room_knowledge(
+            query="표 관련 내용을 찾아줘",
+            room_id="room-alpha",
+            active_document_ids=["sample"],
+            collection_name="rag_chat_hybrid",
+            retrieval_mode="dense",
+            embedding_client=_FakeEmbeddingClient(),
+            qdrant_client=fake_qdrant,
+            enable_rerank=False,
+            enable_mmr=False,
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["room_id"], "room-alpha")
+        self.assertEqual(result["active_document_ids"], ["sample"])
+        self.assertEqual(result["retrieved_count"], 2)
+        self.assertEqual(result["retrievals"][0]["chunk_id"], "text-0001")
+        self.assertEqual(
+            fake_qdrant.calls[0]["query_filter"],
+            {
+                "must": [
+                    {
+                        "key": "room_id",
+                        "match": {"value": "room-alpha"},
+                    },
+                    {
+                        "key": "document_id",
+                        "match": {"any": ["sample"]},
+                    },
+                ]
+            },
+        )
 
     def test_run_stage4_retrieval_applies_mmr_and_parent_window_context(self):
         chunks_payload = {

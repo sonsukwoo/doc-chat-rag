@@ -262,7 +262,9 @@ def _build_retriever(
     bm25_fetch_k: int,
     hybrid_rrf_weights: list[float] | None,
     bm25_excluded_role_hints: list[str],
+    room_id: str | None,
     document_id: str,
+    active_document_ids: list[str],
     restrict_to_document: bool,
     score_threshold: float | None,
 ) -> Any:
@@ -284,7 +286,9 @@ def _build_retriever(
         },
         rrf_weights=hybrid_rrf_weights,
         bm25_excluded_role_hints=bm25_excluded_role_hints,
+        room_id=room_id,
         document_id=document_id,
+        active_document_ids=active_document_ids,
         restrict_to_document=restrict_to_document,
         score_threshold=score_threshold,
     )
@@ -298,6 +302,8 @@ def _build_base_output(
     output_dir: Path,
     output_paths: Stage4OutputPaths,
     document_id: str,
+    room_id: str | None,
+    active_document_ids: list[str],
     collection_name: str,
     retrieval_mode: str,
     top_k: int,
@@ -327,6 +333,8 @@ def _build_base_output(
         ),
         "output_dir": str(output_dir),
         "document_id": document_id,
+        "room_id": room_id,
+        "active_document_ids": active_document_ids,
         "collection_name": collection_name,
         "retrieval_mode": retrieval_mode,
         "top_k": top_k,
@@ -353,7 +361,10 @@ def _build_base_output(
         "fetched_count": 0,
         "retrieved_count": 0,
         "qdrant_configured": qdrant_configured,
-        "document_filter_applied": bool(restrict_to_document and document_id),
+        "room_filter_applied": bool(room_id),
+        "document_filter_applied": bool(
+            restrict_to_document and (document_id or active_document_ids)
+        ),
         "retrievals": [],
         "output_paths": output_paths,
         "planned_outputs": output_paths,
@@ -372,7 +383,9 @@ def _retrieve_documents_with_optional_score_fallback(
     bm25_fetch_k: int,
     hybrid_rrf_weights: list[float] | None,
     bm25_excluded_role_hints: list[str],
+    room_id: str | None,
     document_id: str,
+    active_document_ids: list[str],
     restrict_to_document: bool,
     query: str,
     score_threshold: float | None,
@@ -389,7 +402,9 @@ def _retrieve_documents_with_optional_score_fallback(
         bm25_fetch_k=bm25_fetch_k,
         hybrid_rrf_weights=hybrid_rrf_weights,
         bm25_excluded_role_hints=bm25_excluded_role_hints,
+        room_id=room_id,
         document_id=document_id,
+        active_document_ids=active_document_ids,
         restrict_to_document=restrict_to_document,
         score_threshold=score_threshold,
     )
@@ -413,7 +428,9 @@ def _retrieve_documents_with_optional_score_fallback(
             bm25_fetch_k=bm25_fetch_k,
             hybrid_rrf_weights=hybrid_rrf_weights,
             bm25_excluded_role_hints=bm25_excluded_role_hints,
+            room_id=room_id,
             document_id=document_id,
+            active_document_ids=active_document_ids,
             restrict_to_document=restrict_to_document,
             score_threshold=None,
         )
@@ -522,6 +539,12 @@ def run_stage4_retrieval(
     chunk_lookup = build_chunk_lookup(chunks_document)
 
     explicit_document_id = resolved_inputs.get("document_id")
+    room_id = str(resolved_inputs.get("room_id") or "").strip() or None
+    active_document_ids = [
+        str(item).strip()
+        for item in resolved_inputs.get("active_document_ids") or []
+        if str(item).strip()
+    ]
     if explicit_document_id:
         document_id = explicit_document_id
     else:
@@ -597,6 +620,8 @@ def run_stage4_retrieval(
         output_dir=output_dir,
         output_paths=output_paths,
         document_id=document_id,
+        room_id=room_id,
+        active_document_ids=active_document_ids,
         collection_name=collection_name,
         retrieval_mode=retrieval_mode,
         top_k=top_k,
@@ -666,7 +691,9 @@ def run_stage4_retrieval(
             bm25_fetch_k=bm25_fetch_k,
             hybrid_rrf_weights=hybrid_rrf_weights,
             bm25_excluded_role_hints=bm25_excluded_role_hints,
+            room_id=room_id,
             document_id=document_id,
+            active_document_ids=active_document_ids,
             restrict_to_document=restrict_to_document,
             query=query,
             score_threshold=resolved_score_threshold,

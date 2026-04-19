@@ -8,6 +8,7 @@ from .pipeline import (
 )
 from .retriever import QdrantChunkRetriever, build_qdrant_chunk_retriever
 from .rerank import build_cross_encoder_reranker
+from .service import search_room_knowledge
 
 __all__ = [
     "DEFAULT_CHUNKS_JSON_PATH",
@@ -17,5 +18,6 @@ __all__ = [
     "build_qdrant_chunk_retriever",
     "build_stage4_output_paths",
     "run_stage4_retrieval",
+    "search_room_knowledge",
     "main",
 ]
