@@ -234,6 +234,78 @@ class DocumentRepository:
                 ),
             )
 
+    def get_document(self, document_id: str) -> dict[str, Any] | None:
+        query = f"""
+            SELECT
+                document_id,
+                original_filename,
+                normalized_filename,
+                file_hash,
+                storage_root,
+                source_pdf_path,
+                source_kind,
+                lifecycle_status,
+                metadata
+            FROM {_doc_table("documents")}
+            WHERE document_id = %s
+        """
+        with self.connection.cursor() as cursor:
+            cursor.execute(query, (document_id,))
+            return cursor.fetchone()
+
+    def upsert_document_profile(
+        self,
+        *,
+        document_id: str,
+        title: str,
+        document_type: str,
+        main_topics: list[str] | None = None,
+        keywords: list[str] | None = None,
+        section_titles: list[str] | None = None,
+        short_summary: str = "",
+        profile_json: dict[str, Any] | None = None,
+        source_stage: str = "stage2",
+    ) -> None:
+        query = f"""
+            INSERT INTO {_doc_table("document_profiles")} (
+                document_id,
+                title,
+                document_type,
+                main_topics,
+                keywords,
+                section_titles,
+                short_summary,
+                profile_json,
+                source_stage
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (document_id) DO UPDATE
+            SET title = EXCLUDED.title,
+                document_type = EXCLUDED.document_type,
+                main_topics = EXCLUDED.main_topics,
+                keywords = EXCLUDED.keywords,
+                section_titles = EXCLUDED.section_titles,
+                short_summary = EXCLUDED.short_summary,
+                profile_json = EXCLUDED.profile_json,
+                source_stage = EXCLUDED.source_stage,
+                updated_at = NOW()
+        """
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                (
+                    document_id,
+                    title,
+                    document_type,
+                    _normalize_jsonb(main_topics or []),
+                    _normalize_jsonb(keywords or []),
+                    _normalize_jsonb(section_titles or []),
+                    short_summary,
+                    _normalize_jsonb(profile_json),
+                    source_stage,
+                ),
+            )
+
     def attach_document_to_thread(
         self,
         *,
@@ -315,6 +387,83 @@ class DocumentRepository:
         with self.connection.cursor() as cursor:
             cursor.execute(query, (normalized_document_ids,))
             return list(cursor.fetchall())
+
+    def list_documents(
+        self,
+        document_ids: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """여러 문서의 기본 메타데이터와 JSON metadata를 한 번에 읽는다."""
+        normalized_document_ids = [
+            str(item).strip() for item in document_ids if str(item).strip()
+        ]
+        if not normalized_document_ids:
+            return []
+
+        query = f"""
+            SELECT
+                document_id,
+                original_filename,
+                normalized_filename,
+                storage_root,
+                source_pdf_path,
+                metadata
+            FROM {_doc_table("documents")}
+            WHERE document_id = ANY(%s)
+            ORDER BY document_id ASC
+        """
+        with self.connection.cursor() as cursor:
+            cursor.execute(query, (normalized_document_ids,))
+            return list(cursor.fetchall())
+
+    def list_document_profiles(
+        self,
+        document_ids: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        normalized_document_ids = [
+            str(item).strip() for item in document_ids if str(item).strip()
+        ]
+        if not normalized_document_ids:
+            return []
+
+        query = f"""
+            SELECT
+                document_id,
+                title,
+                document_type,
+                main_topics,
+                keywords,
+                section_titles,
+                short_summary,
+                profile_json,
+                source_stage
+            FROM {_doc_table("document_profiles")}
+            WHERE document_id = ANY(%s)
+            ORDER BY document_id ASC
+        """
+        with self.connection.cursor() as cursor:
+            cursor.execute(query, (normalized_document_ids,))
+            return list(cursor.fetchall())
+
+    def update_document_metadata(
+        self,
+        *,
+        document_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        query = f"""
+            UPDATE {_doc_table("documents")}
+            SET metadata = %s,
+                updated_at = NOW()
+            WHERE document_id = %s
+        """
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                (
+                    _normalize_jsonb(metadata),
+                    document_id,
+                ),
+            )
 
     def list_document_parents(
         self,

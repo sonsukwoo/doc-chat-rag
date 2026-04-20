@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from backend.stage4_retrieval.pipeline import run_stage4_retrieval
 from backend.stage4_retrieval.retriever import QdrantChunkRetriever
-from backend.stage4_retrieval.service import search_room_knowledge
+from backend.stage4_retrieval.service import search_thread_knowledge
 
 
 class _FakeEmbeddingClient:
@@ -105,6 +105,43 @@ class _MappedEmbeddingClient:
 
     def embed_texts(self, texts):
         return [list(self.mapping[text]) for text in texts]
+
+
+class _DocumentScopedFakeQdrantClient(_FakeQdrantClient):
+    def query_points(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        query_filter = kwargs.get("query_filter") or {}
+        document_ids: list[str] = []
+        for condition in query_filter.get("must") or []:
+            if condition.get("key") != "document_id":
+                continue
+            match = dict(condition.get("match") or {})
+            if match.get("value"):
+                document_ids.append(str(match["value"]))
+            document_ids.extend(
+                str(item)
+                for item in match.get("any") or []
+                if str(item).strip()
+            )
+        document_id = document_ids[0] if document_ids else "sample"
+        return [
+            {
+                "id": f"point-{document_id}",
+                "score": 0.91,
+                "payload": {
+                    "document_id": document_id,
+                    "chunk_id": f"{document_id}-chunk-1",
+                    "parent_id": f"{document_id}-parent-1",
+                    "chunk_type": "text",
+                    "text": f"{document_id}의 핵심 내용입니다.",
+                    "section_title": f"{document_id} section",
+                    "primary_page": 1,
+                    "page_start": 1,
+                    "page_end": 1,
+                    "has_asset": False,
+                },
+            }
+        ]
 
 
 class _FakeCrossEncoderReranker:
@@ -273,7 +310,7 @@ class Stage4RetrievalTests(unittest.TestCase):
             self.assertEqual(first_hit["dense_score"], 0.91)
             self.assertIsNone(first_hit["bm25_score"])
 
-    def test_qdrant_chunk_retriever_applies_room_and_active_document_filters(self):
+    def test_qdrant_chunk_retriever_applies_thread_and_active_document_filters(self):
         fake_qdrant = _FakeQdrantClient()
         retriever = QdrantChunkRetriever(
             embedding_client=_FakeEmbeddingClient(),
@@ -288,7 +325,7 @@ class Stage4RetrievalTests(unittest.TestCase):
                 "language": "none",
                 "ascii_folding": False,
             },
-            room_id="room-alpha",
+            thread_id="thread-alpha",
             active_document_ids=["doc-1", "doc-2"],
             restrict_to_document=True,
         )
@@ -300,8 +337,8 @@ class Stage4RetrievalTests(unittest.TestCase):
             {
                 "must": [
                     {
-                        "key": "room_id",
-                        "match": {"value": "room-alpha"},
+                        "key": "thread_id",
+                        "match": {"value": "thread-alpha"},
                     },
                     {
                         "key": "document_id",
@@ -311,7 +348,7 @@ class Stage4RetrievalTests(unittest.TestCase):
             },
         )
 
-    def test_run_stage4_retrieval_marks_room_filter_when_room_scope_is_given(self):
+    def test_run_stage4_retrieval_marks_thread_filter_when_thread_scope_is_given(self):
         chunks_payload = {
             "cleaned_json_path": "/tmp/sample/cleaned.json",
             "chunks": [
@@ -337,7 +374,7 @@ class Stage4RetrievalTests(unittest.TestCase):
                     "query": "첫 번째 청크를 찾아줘",
                     "chunks_json_path": str(chunks_json_path),
                     "output_dir": str(temp_path),
-                    "room_id": "room-alpha",
+                    "thread_id": "thread-alpha",
                     "active_document_ids": ["sample", "sample-2"],
                     "retrieval_mode": "dense",
                 },
@@ -346,17 +383,17 @@ class Stage4RetrievalTests(unittest.TestCase):
             )
 
             self.assertEqual(result["status"], "completed")
-            self.assertEqual(result["room_id"], "room-alpha")
+            self.assertEqual(result["thread_id"], "thread-alpha")
             self.assertEqual(result["active_document_ids"], ["sample", "sample-2"])
-            self.assertTrue(result["room_filter_applied"])
+            self.assertTrue(result["thread_filter_applied"])
             self.assertTrue(result["document_filter_applied"])
             self.assertEqual(
                 fake_qdrant.calls[0]["query_filter"],
                 {
                     "must": [
                         {
-                            "key": "room_id",
-                            "match": {"value": "room-alpha"},
+                            "key": "thread_id",
+                            "match": {"value": "thread-alpha"},
                         },
                         {
                             "key": "document_id",
@@ -607,11 +644,11 @@ class Stage4RetrievalTests(unittest.TestCase):
             self.assertEqual(fake_qdrant.calls[0]["score_threshold"], 0.9)
             self.assertIsNone(fake_qdrant.calls[1]["score_threshold"])
 
-    def test_search_room_knowledge_returns_room_scoped_hits(self):
+    def test_search_thread_knowledge_returns_thread_scoped_hits(self):
         fake_qdrant = _FakeQdrantClient()
-        result = search_room_knowledge(
+        result = search_thread_knowledge(
             query="표 관련 내용을 찾아줘",
-            room_id="room-alpha",
+            thread_id="thread-alpha",
             active_document_ids=["sample"],
             collection_name="rag_chat_hybrid",
             retrieval_mode="dense",
@@ -622,7 +659,7 @@ class Stage4RetrievalTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["room_id"], "room-alpha")
+        self.assertEqual(result["thread_id"], "thread-alpha")
         self.assertEqual(result["active_document_ids"], ["sample"])
         self.assertEqual(result["retrieved_count"], 2)
         self.assertEqual(result["retrievals"][0]["chunk_id"], "text-0001")
@@ -631,8 +668,8 @@ class Stage4RetrievalTests(unittest.TestCase):
             {
                 "must": [
                     {
-                        "key": "room_id",
-                        "match": {"value": "room-alpha"},
+                        "key": "thread_id",
+                        "match": {"value": "thread-alpha"},
                     },
                     {
                         "key": "document_id",
@@ -640,6 +677,74 @@ class Stage4RetrievalTests(unittest.TestCase):
                     },
                 ]
             },
+        )
+
+    def test_search_thread_knowledge_can_retrieve_multiple_documents_independently(self):
+        fake_qdrant = _DocumentScopedFakeQdrantClient()
+        result = search_thread_knowledge(
+            query="두 문서 핵심 차이를 정리해줘",
+            thread_id="thread-alpha",
+            active_document_ids=["doc-2", "doc-3"],
+            document_queries={
+                "doc-2": "2번 문서 핵심 요약",
+                "doc-3": "3번 문서 핵심 요약",
+            },
+            collection_name="rag_chat_hybrid",
+            retrieval_mode="dense",
+            top_k=4,
+            use_per_document_search=True,
+            embedding_client=_FakeEmbeddingClient(),
+            qdrant_client=fake_qdrant,
+            enable_rerank=False,
+            enable_mmr=False,
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["per_document_search_used"])
+        self.assertEqual(result["active_document_ids"], ["doc-2", "doc-3"])
+        self.assertEqual(
+            result["document_queries"],
+            {
+                "doc-2": "2번 문서 핵심 요약",
+                "doc-3": "3번 문서 핵심 요약",
+            },
+        )
+        self.assertEqual(result["retrieved_count"], 2)
+        self.assertEqual(
+            [item["document_id"] for item in result["retrievals"]],
+            ["doc-2", "doc-3"],
+        )
+        self.assertEqual(len(fake_qdrant.calls), 2)
+        query_filters = [call["query_filter"] for call in fake_qdrant.calls]
+        self.assertIn(
+            {
+                "must": [
+                    {
+                        "key": "thread_id",
+                        "match": {"value": "thread-alpha"},
+                    },
+                    {
+                        "key": "document_id",
+                        "match": {"any": ["doc-2"]},
+                    },
+                ]
+            },
+            query_filters,
+        )
+        self.assertIn(
+            {
+                "must": [
+                    {
+                        "key": "thread_id",
+                        "match": {"value": "thread-alpha"},
+                    },
+                    {
+                        "key": "document_id",
+                        "match": {"any": ["doc-3"]},
+                    },
+                ]
+            },
+            query_filters,
         )
 
     def test_run_stage4_retrieval_applies_mmr_and_parent_window_context(self):

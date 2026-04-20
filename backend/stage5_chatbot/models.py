@@ -2,7 +2,51 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+
+class DocumentSelectionResult(BaseModel):
+    """문서 프로파일만 보고 질문 대상 문서를 고르는 구조화 응답."""
+
+    query_type: Literal[
+        "single_document",
+        "multi_document",
+        "comparison",
+        "thread_wide",
+        "open_domain",
+        "clarification_needed",
+    ] = Field(
+        description=(
+            "질문 유형. single_document, multi_document, comparison, "
+            "thread_wide, open_domain, clarification_needed 중 하나."
+        )
+    )
+    selected_document_ids: list[str] = Field(
+        default_factory=list,
+        description="현재 스레드 문서 중 검색 대상으로 선택한 document_id 목록.",
+    )
+    per_document_queries: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "문서별 검색 질의를 따로 쓰는 편이 좋을 때만 document_id별 질의를 제공."
+        ),
+    )
+    retrieval_mode: Literal["dense", "hybrid"] | None = Field(
+        default=None,
+        description=(
+            "문서 검색이 필요할 때 권장 검색 모드. 확실하지 않으면 null."
+        ),
+    )
+    answer_strategy: Literal["profile_only", "retrieve_chunks"] | None = Field(
+        default=None,
+        description=(
+            "문서 프로파일만으로 답할 수 있으면 profile_only, "
+            "실제 문서 청크 검색이 필요하면 retrieve_chunks, "
+            "확실하지 않으면 null."
+        ),
+    )
 
 
 class FinalAnswerResult(BaseModel):
@@ -16,23 +60,20 @@ class FinalAnswerResult(BaseModel):
     )
 
 
-class GroundingCheckResult(BaseModel):
-    """retrieval 근거가 현재 질문에 충분한지 판단하는 구조화 응답."""
+class GroundingDecisionResult(BaseModel):
+    """grounding 이후 그래프가 취할 다음 action을 결정하는 구조화 응답."""
 
-    enough_evidence: bool = Field(
-        description="현재 검색 근거만으로 질문에 답할 수 있으면 true."
-    )
-    needs_deeper_retrieval: bool = Field(
-        description="현재 근거가 일부 관련되지만 부족해 추가 검색이 필요하면 true."
-    )
-    needs_clarification: bool = Field(
-        description="질문 범위가 모호하거나 대상이 불명확해 사용자 확인이 필요하면 true."
+    action: Literal["answer", "retrieve_deeper", "clarify"] = Field(
+        description=(
+            "현재 근거만으로 충분하면 answer, "
+            "추가 검색이 필요하면 retrieve_deeper, "
+            "질문 범위가 모호하면 clarify."
+        )
     )
     clarification_question: str | None = Field(
         default=None,
-        description="사용자에게 되물어야 한다면 보여줄 짧은 한국어 질문. 아니면 null.",
+        description="action이 clarify일 때만 사용자에게 되물을 짧은 한국어 질문.",
     )
-    missing_aspects: list[str] = Field(
-        default_factory=list,
-        description="현재 부족한 정보 항목을 짧게 나열. 없으면 빈 리스트.",
-    )
+
+
+GroundingCheckResult = GroundingDecisionResult

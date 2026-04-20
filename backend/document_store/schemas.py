@@ -28,5 +28,6 @@ class DocumentRecord(TypedDict, total=False):
 
     document_id: str
     original_filename: str
+    normalized_filename: str
     uploaded_at: str
     stages: dict[str, DocumentStageRecord]

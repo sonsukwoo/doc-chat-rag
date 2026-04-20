@@ -74,8 +74,19 @@ def run_stage5_chatbot(
     if collection_name is None:
         collection_name = build_thread_collection_name(thread_id)
     retrieval_mode = str(
-        (thread_context or {}).get("default_retrieval_mode") or "dense"
+        inputs.get("thread_default_retrieval_mode")
+        or (thread_context or {}).get("default_retrieval_mode")
+        or "dense"
     ).strip() or "dense"
+    document_profiles = [
+        dict(item)
+        for item in (
+            inputs.get("document_profiles")
+            or (thread_context or {}).get("document_profiles")
+            or []
+        )
+        if isinstance(item, dict)
+    ]
     allow_web_search = bool(inputs.get("allow_web_search"))
     context_window_loader = (
         inputs.get("_context_window_loader") or load_expanded_context_blocks
@@ -85,13 +96,21 @@ def run_stage5_chatbot(
     tools = build_stage5_tools(
         allow_web_search=allow_web_search,
         stage4_runner=stage4_runner
-        or (lambda *, query, thread_id, active_document_ids, collection_name=None, retrieval_mode=None: search_thread_knowledge(
-            query=query,
-            thread_id=thread_id,
-            active_document_ids=active_document_ids,
-            collection_name=collection_name,
-            retrieval_mode=retrieval_mode,
-        )),
+        or (
+            lambda **kwargs: search_thread_knowledge(
+                query=kwargs["query"],
+                thread_id=kwargs.get("thread_id"),
+                active_document_ids=kwargs.get("active_document_ids"),
+                document_queries=kwargs.get("document_queries"),
+                collection_name=kwargs.get("collection_name"),
+                retrieval_mode=kwargs.get("retrieval_mode"),
+                top_k=kwargs.get("top_k"),
+                use_per_document_search=kwargs.get("use_per_document_search"),
+                score_threshold=kwargs.get("score_threshold"),
+                enable_rerank=kwargs.get("enable_rerank"),
+                enable_mmr=kwargs.get("enable_mmr"),
+            )
+        ),
         context_window_loader=context_window_loader,
         visual_asset_loader=visual_asset_loader,
     )
@@ -104,7 +123,15 @@ def run_stage5_chatbot(
     graph_inputs = {
         **public_inputs,
         "thread_id": thread_id,
+        "thread_name": str(
+            inputs.get("thread_name")
+            or (thread_context or {}).get("thread_name")
+            or ""
+        ).strip()
+        or None,
+        "thread_default_retrieval_mode": retrieval_mode,
         "active_document_ids": active_document_ids,
+        "document_profiles": document_profiles,
         "collection_name": collection_name,
         "allow_web_search": allow_web_search,
     }
@@ -123,6 +150,7 @@ def run_stage5_chatbot(
             tools=tools,
             llm=llm or get_agent_model(),
             retrieval_runner=stage4_runner or search_thread_knowledge,
+            context_window_loader=context_window_loader,
         )
         result = graph.invoke(graph_command, config=config)
     else:
@@ -132,6 +160,7 @@ def run_stage5_chatbot(
                 tools=tools,
                 llm=llm or get_agent_model(),
                 retrieval_runner=stage4_runner or search_thread_knowledge,
+                context_window_loader=context_window_loader,
             )
             result = graph.invoke(graph_command, config=config)
 
@@ -159,7 +188,12 @@ def run_stage5_chatbot(
         "evidence_chunks": list(result.get("evidence_chunks") or []),
         "interrupt": interrupt_payload,
         "retrieval_mode": str(
-            (result.get("retrieval_policy") or {}).get("mode") or ""
-        ),
+            (dict(result.get("debug_trace") or {}) or {}).get("executed_retrieval_mode")
+            or (dict(result.get("debug_trace") or {}) or {}).get("retrieval_mode")
+            or (result.get("retrieval_policy") or {}).get("mode")
+            or ""
+        ).strip()
+        or None,
         "logs": list(result.get("logs") or []),
+        "debug_trace": dict(result.get("debug_trace") or {}) or None,
     }

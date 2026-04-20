@@ -127,7 +127,6 @@ export function DocumentsPage() {
           setThreadName("");
           setBootstrapFile(null);
         }}
-        onRefresh={() => void refreshThreads()}
         onDeleteThread={(threadId) => void handleDeleteThread(threadId)}
         deletingThreadId={deletingThreadId}
       />
@@ -165,7 +164,7 @@ export function DocumentsPage() {
               </label>
 
               <label className="field-group">
-                <span>검색 모드</span>
+                <span>기본 검색 모드</span>
                 <select
                   className="input"
                   value={defaultRetrievalMode}

@@ -21,8 +21,10 @@ from backend.document_store import (
     update_document_stage_record,
 )
 from backend.thread_identity import (
-    build_thread_collection_name,
     build_thread_id,
+    ensure_thread_metadata,
+    resolve_thread_collection_name,
+    THREAD_COLLECTION_NAME_METADATA_KEY,
 )
 from backend.stage3_indexing.config import (
     STAGE3_QDRANT_API_KEY,
@@ -76,9 +78,29 @@ def _normalize_pdf_filename(original_filename: str) -> str:
     if not normalized_filename.lower().endswith(".pdf"):
         raise ValueError("only PDF upload is supported")
     return normalized_filename
+
+
 def _build_thread_document_id(thread_id: str, original_filename: str) -> str:
     stem = Path(original_filename or "uploaded.pdf").stem
     return sanitize_document_id(f"{thread_id}__{stem}")
+
+
+def _serialize_thread_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    public_metadata = dict(metadata or {})
+    public_metadata.pop(THREAD_COLLECTION_NAME_METADATA_KEY, None)
+    return public_metadata
+
+
+def _normalize_thread_metadata_input(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    normalized_metadata = dict(metadata or {})
+    normalized_metadata.pop(THREAD_COLLECTION_NAME_METADATA_KEY, None)
+    return normalized_metadata
+
+
+def _resolve_thread_collection_name(thread_row: dict[str, Any]) -> str:
+    thread_id = str(thread_row.get("thread_id") or "")
+    metadata = dict(thread_row.get("metadata") or {})
+    return resolve_thread_collection_name(thread_id, metadata=metadata)
 
 
 def _serialize_thread(
@@ -87,10 +109,14 @@ def _serialize_thread(
     active_document_ids: list[str],
 ) -> ThreadPayload:
     thread_id = str(thread_row.get("thread_id") or "")
+    metadata = dict(thread_row.get("metadata") or {})
     return {
         "thread_id": thread_id,
         "thread_name": str(thread_row.get("thread_name") or ""),
-        "collection_name": build_thread_collection_name(thread_id),
+        "collection_name": resolve_thread_collection_name(
+            thread_id,
+            metadata=metadata,
+        ),
         "description": (
             str(thread_row.get("description"))
             if thread_row.get("description") not in (None, "")
@@ -99,7 +125,7 @@ def _serialize_thread(
         "default_retrieval_mode": str(
             thread_row.get("default_retrieval_mode") or "dense"
         ),
-        "metadata": dict(thread_row.get("metadata") or {}),
+        "metadata": _serialize_thread_metadata(metadata),
         "active_document_ids": active_document_ids,
         "document_count": len(active_document_ids),
         "created_at": (
@@ -227,8 +253,9 @@ def create_thread(
         raise ValueError("thread_name is required")
 
     thread_id = build_thread_id(normalized_thread_name)
-    resolved_metadata = dict(metadata or {})
+    resolved_metadata = _normalize_thread_metadata_input(metadata)
     resolved_metadata.setdefault("lifecycle_status", "draft")
+    resolved_metadata = ensure_thread_metadata(thread_id, resolved_metadata)
 
     with app_db_connection() as connection:
         chat_repository = ChatRepository(connection)
@@ -268,7 +295,8 @@ def update_thread(
 
         merged_metadata = dict(current.get("metadata") or {})
         if metadata is not None:
-            merged_metadata.update(metadata)
+            merged_metadata.update(_normalize_thread_metadata_input(metadata))
+        merged_metadata = ensure_thread_metadata(normalized_thread_id, merged_metadata)
 
         chat_repository.upsert_thread(
             thread_id=normalized_thread_id,
@@ -359,7 +387,7 @@ def delete_thread_permanently(thread_id: str) -> ThreadDeletionPayload | None:
         chat_repository.delete_thread(normalized_thread_id)
         connection.commit()
 
-        deleted_collection_name = build_thread_collection_name(normalized_thread_id)
+        deleted_collection_name = _resolve_thread_collection_name(thread)
         if retained_document_ids:
             cleanup_warnings.append(
                 "다른 채팅방과 연결된 문서는 유지되었습니다: "
@@ -407,13 +435,15 @@ def upload_document_to_thread(
     if thread is None:
         raise FileNotFoundError("thread not found")
 
+    resolved_original_filename = str(original_filename or "").strip() or normalized_filename
     document_id = _build_thread_document_id(normalized_thread_id, normalized_filename)
     paths = build_document_paths(document_id)
     if paths.root.exists():
         shutil.rmtree(paths.root)
 
     record = create_document_record(
-        original_filename=normalized_filename,
+        original_filename=resolved_original_filename,
+        normalized_filename=normalized_filename,
         document_id=document_id,
     )
     saved_path = save_uploaded_pdf(document_id=document_id, content=content)
@@ -428,7 +458,7 @@ def upload_document_to_thread(
         document_repository = DocumentRepository(connection)
         document_repository.upsert_document(
             document_id=document_id,
-            original_filename=normalized_filename,
+            original_filename=resolved_original_filename,
             normalized_filename=normalized_filename,
             storage_root=str(paths.root),
             source_pdf_path=str(saved_path),

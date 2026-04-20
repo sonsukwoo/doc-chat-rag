@@ -189,6 +189,7 @@ def sync_document_record(
     *,
     document_id: str,
     original_filename: str | None = None,
+    normalized_filename: str | None = None,
     root: str | Path = DEFAULT_DOCUMENTS_ROOT,
 ) -> DocumentRecord:
     """현재 디스크 산출물을 기준으로 document.json을 다시 맞춘다."""
@@ -207,9 +208,15 @@ def sync_document_record(
         or str(existing.get("original_filename") or "").strip()
         or f"{document_id}.pdf"
     )
+    resolved_normalized_filename = (
+        normalized_filename
+        or str(existing.get("normalized_filename") or "").strip()
+        or resolved_original_filename
+    )
     record: DocumentRecord = {
         "document_id": document_id,
         "original_filename": resolved_original_filename,
+        "normalized_filename": resolved_normalized_filename,
         "uploaded_at": str(existing.get("uploaded_at") or _now_iso()),
         "stages": _default_stage_map(),
     }
@@ -271,6 +278,7 @@ def load_document_record(
 def create_document_record(
     *,
     original_filename: str,
+    normalized_filename: str | None = None,
     document_id: str | None = None,
     root: str | Path = DEFAULT_DOCUMENTS_ROOT,
 ) -> DocumentRecord:
@@ -285,6 +293,7 @@ def create_document_record(
     record: DocumentRecord = {
         "document_id": resolved_document_id,
         "original_filename": original_filename,
+        "normalized_filename": normalized_filename or original_filename,
         "uploaded_at": _now_iso(),
         "stages": _default_stage_map(),
     }

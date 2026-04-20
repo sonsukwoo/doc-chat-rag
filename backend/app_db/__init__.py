@@ -18,12 +18,14 @@ from .repositories import (
     app_db_connection,
 )
 from .services import (
+    DocumentRuntimeProfilePayload,
     ExpandedContextBlockPayload,
     ThreadRuntimeContext,
     VisualAssetPayload,
     load_expanded_context_blocks,
     load_thread_runtime_context,
     load_visual_assets,
+    sync_document_profile_snapshot,
     sync_document_runtime_metadata,
     try_load_thread_runtime_context,
 )
@@ -42,12 +44,14 @@ __all__ = [
     "ChatRepository",
     "CheckpointRepository",
     "DocumentRepository",
+    "DocumentRuntimeProfilePayload",
     "ExpandedContextBlockPayload",
     "ThreadRuntimeContext",
     "VisualAssetPayload",
     "load_expanded_context_blocks",
     "load_thread_runtime_context",
     "load_visual_assets",
+    "sync_document_profile_snapshot",
     "try_load_thread_runtime_context",
     "sync_document_runtime_metadata",
 ]

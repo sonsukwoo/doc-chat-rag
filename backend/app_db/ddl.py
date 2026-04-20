@@ -56,6 +56,22 @@ def build_schema_ddl() -> list[str]:
         );
         """,
         f"""
+        CREATE TABLE IF NOT EXISTS {doc}.document_profiles (
+            document_id TEXT PRIMARY KEY REFERENCES {doc}.documents(document_id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            document_type TEXT NOT NULL,
+            main_topics JSONB NOT NULL DEFAULT '[]'::jsonb,
+            keywords JSONB NOT NULL DEFAULT '[]'::jsonb,
+            section_titles JSONB NOT NULL DEFAULT '[]'::jsonb,
+            short_summary TEXT NOT NULL DEFAULT '',
+            profile_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            source_stage TEXT NOT NULL DEFAULT 'stage2',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """,
+        f"CREATE INDEX IF NOT EXISTS idx_document_profiles_source_stage ON {doc}.document_profiles(source_stage);",
+        f"""
         CREATE TABLE IF NOT EXISTS {doc}.thread_documents (
             thread_id TEXT NOT NULL REFERENCES {chat}.threads(thread_id) ON DELETE CASCADE,
             document_id TEXT NOT NULL REFERENCES {doc}.documents(document_id) ON DELETE CASCADE,

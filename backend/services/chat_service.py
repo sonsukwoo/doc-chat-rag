@@ -8,7 +8,12 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from backend.stage5_chatbot import run_stage5_chatbot
 from backend.stage5_chatbot.checkpointer import stage5_checkpointer_context
-from backend.stage5_chatbot.schemas import ChatbotInterruptPayload
+from backend.stage5_chatbot.schemas import (
+    ChatbotCitationPayload,
+    ChatbotDebugTracePayload,
+    ChatbotEvidenceChunkPayload,
+    ChatbotInterruptPayload,
+)
 from backend.stage5_chatbot.schemas import Stage5Output
 
 from .thread_service import ThreadPayload, get_thread_detail
@@ -18,6 +23,11 @@ class ThreadChatHistoryMessagePayload(TypedDict):
     role: Literal["user", "assistant"]
     content: str
     kind: Literal["answer", "interrupt"]
+    created_at: str | None
+    citations: list[ChatbotCitationPayload]
+    evidence_chunks: list[ChatbotEvidenceChunkPayload]
+    retrieval_mode: str | None
+    debug_trace: ChatbotDebugTracePayload | None
 
 
 class ThreadChatViewPayload(TypedDict, total=False):
@@ -38,16 +48,29 @@ def _serialize_visible_messages(
     raw_messages: list[Any],
 ) -> list[ThreadChatHistoryMessagePayload]:
     visible_messages: list[ThreadChatHistoryMessagePayload] = []
+
+    def _normalize_thread_chat_metadata(message: Any) -> dict[str, Any]:
+        metadata = dict(getattr(message, "additional_kwargs", {}) or {}).get("thread_chat")
+        if not isinstance(metadata, dict):
+            return {}
+        return metadata
+
     for message in raw_messages:
         if isinstance(message, HumanMessage):
             content = str(message.content or "").strip()
             if not content:
                 continue
+            metadata = _normalize_thread_chat_metadata(message)
             visible_messages.append(
                 {
                     "role": "user",
                     "content": content,
                     "kind": "answer",
+                    "created_at": str(metadata.get("created_at") or "").strip() or None,
+                    "citations": [],
+                    "evidence_chunks": [],
+                    "retrieval_mode": None,
+                    "debug_trace": None,
                 }
             )
             continue
@@ -56,13 +79,44 @@ def _serialize_visible_messages(
             content = str(message.content or "").strip()
             if not content:
                 continue
-            visible_messages.append(
-                {
-                    "role": "assistant",
-                    "content": content,
-                    "kind": "answer",
-                }
-            )
+            metadata = _normalize_thread_chat_metadata(message)
+            if not metadata:
+                # Tool loop 안의 intermediate AI draft는 사용자 히스토리에 노출하지 않는다.
+                continue
+            payload: ThreadChatHistoryMessagePayload = {
+                "role": "assistant",
+                "content": content,
+                "kind": "answer",
+                "created_at": str(metadata.get("created_at") or "").strip() or None,
+                "citations": list(metadata.get("citations") or []),
+                "evidence_chunks": list(metadata.get("evidence_chunks") or []),
+                "retrieval_mode": str(metadata.get("retrieval_mode") or "").strip()
+                or None,
+                "debug_trace": (
+                    dict(metadata.get("debug_trace") or {}) or None
+                ),
+            }
+            if (
+                visible_messages
+                and visible_messages[-1]["role"] == "assistant"
+                and visible_messages[-1]["kind"] == "answer"
+                and visible_messages[-1]["content"] == content
+            ):
+                previous = visible_messages[-1]
+                previous_has_metadata = bool(
+                    previous.get("citations")
+                    or previous.get("evidence_chunks")
+                    or previous.get("debug_trace")
+                )
+                current_has_metadata = bool(
+                    payload["citations"]
+                    or payload["evidence_chunks"]
+                    or payload["debug_trace"]
+                )
+                if current_has_metadata or not previous_has_metadata:
+                    visible_messages[-1] = payload
+                continue
+            visible_messages.append(payload)
 
     return visible_messages
 
@@ -143,6 +197,11 @@ def load_thread_chat_view(thread_id: str) -> ThreadChatViewPayload:
                     "role": "assistant",
                     "content": interrupt_content,
                     "kind": "interrupt",
+                    "created_at": None,
+                    "citations": [],
+                    "evidence_chunks": [],
+                    "retrieval_mode": None,
+                    "debug_trace": None,
                 }
             )
 

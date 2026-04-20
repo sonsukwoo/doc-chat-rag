@@ -89,6 +89,45 @@ export interface ChatEvidenceChunk {
   text_excerpt: string;
 }
 
+export interface ChatToolTrace {
+  name: string;
+  label?: string;
+  status?: string | null;
+  query?: string | null;
+  document_ids?: string[];
+  chunk_ids?: string[];
+  asset_ref?: string | null;
+  retrieved_count?: number | null;
+  retrieval_mode?: string | null;
+  rerank_requested?: boolean | null;
+  rerank_applied?: boolean | null;
+  rerank_error?: string | null;
+  mmr_requested?: boolean | null;
+  mmr_applied?: boolean | null;
+  per_document_search_used?: boolean | null;
+  score_threshold_applied?: number | null;
+  score_fallback_applied?: boolean | null;
+  top_k?: number | null;
+  fetch_k?: number | null;
+  block_count?: number | null;
+  message?: string | null;
+}
+
+export interface ChatDebugTrace {
+  model?: string;
+  query_kind?: string;
+  selection_type?: string;
+  selection_source?: string;
+  selection_reason?: string;
+  selected_document_ids?: string[];
+  selected_document_queries?: Record<string, string>;
+  thread_default_retrieval_mode?: string | null;
+  retrieval_mode?: string | null;
+  executed_retrieval_mode?: string | null;
+  logs?: string[];
+  tool_calls?: ChatToolTrace[];
+}
+
 export interface ChatInterruptPayload {
   kind?: "clarification";
   question?: string;
@@ -100,6 +139,11 @@ export interface ThreadChatHistoryMessage {
   role: "user" | "assistant";
   content: string;
   kind: "answer" | "interrupt";
+  created_at?: string | null;
+  citations?: ChatCitation[];
+  evidence_chunks?: ChatEvidenceChunk[];
+  retrieval_mode?: string | null;
+  debug_trace?: ChatDebugTrace | null;
 }
 
 export interface ThreadChatTurnResult {
@@ -112,6 +156,7 @@ export interface ThreadChatTurnResult {
   interrupt?: ChatInterruptPayload | null;
   retrieval_mode?: string;
   logs?: string[];
+  debug_trace?: ChatDebugTrace | null;
 }
 
 export interface ReviewElement {

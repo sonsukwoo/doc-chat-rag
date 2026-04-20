@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
+from backend.app_db import try_load_thread_runtime_context
 from backend.common import derive_document_id_from_artifact_path
 from backend.thread_identity import build_thread_collection_name
 from backend.stage3_chunking.embeddings import OpenAIEmbeddingClient
@@ -277,6 +278,11 @@ def run_stage3_indexing(
 
     thread_id = str(inputs.get("thread_id") or "").strip() or None
     collection_name = str(inputs.get("collection_name") or "").strip() or None
+    if not collection_name and thread_id:
+        runtime_context = try_load_thread_runtime_context(thread_id)
+        collection_name = str(
+            (runtime_context or {}).get("collection_name") or ""
+        ).strip() or None
     if not collection_name and thread_id:
         collection_name = build_thread_collection_name(thread_id)
     if not collection_name:

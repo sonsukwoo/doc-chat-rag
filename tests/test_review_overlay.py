@@ -59,6 +59,14 @@ class ReviewOverlayTests(unittest.TestCase):
                 "backend.review_overlay.service.build_document_paths",
                 side_effect=lambda document_id: build_document_paths(document_id, root=root),
             ), patch(
+                "backend.review_overlay.service.load_document_record",
+                return_value={
+                    "original_filename": "테스트.pdf",
+                    "normalized_filename": "test.pdf",
+                },
+            ), patch(
+                "backend.review_overlay.service.sync_document_profile_snapshot"
+            ) as mock_sync_profile, patch(
                 "backend.review_overlay.service.update_document_stage_record",
                 return_value=None,
             ):
@@ -92,3 +100,11 @@ class ReviewOverlayTests(unittest.TestCase):
                 self.assertEqual(result["stats"]["dropped_elements"], 1)
                 self.assertEqual(len(reviewed_payload["elements"]), 1)
                 self.assertEqual(reviewed_payload["elements"][0]["category"], "heading")
+                self.assertEqual(
+                    mock_sync_profile.call_args.kwargs["raw_profile"]["title"],
+                    "테스트",
+                )
+                self.assertEqual(
+                    mock_sync_profile.call_args.kwargs["source_stage"],
+                    "review",
+                )

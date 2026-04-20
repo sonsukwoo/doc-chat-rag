@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
-import type { DragEvent } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { DragEvent, KeyboardEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
+import { ChatTraceDetails } from "../components/ChatTraceDetails";
 import { ThreadSidebar } from "../components/ThreadSidebar";
 import {
   buildStageAssetUrl,
@@ -13,12 +14,11 @@ import {
   sendThreadChatMessage,
 } from "../lib/api";
 import {
-  getThreadLifecycleLabel,
-  getThreadLifecycleTone,
   isThreadReady,
 } from "../lib/threadUi";
 import type {
   ChatCitation,
+  ChatDebugTrace,
   ChatEvidenceChunk,
   ChatVisualAsset,
   ThreadChatHistoryMessage,
@@ -30,12 +30,13 @@ type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
-  kind: "answer" | "interrupt" | "error";
+  kind: "answer" | "interrupt" | "error" | "pending";
   createdAt?: string | null;
   citations?: ChatCitation[];
   evidenceChunks?: ChatEvidenceChunk[];
   visualAssets?: ChatVisualAsset[];
   retrievalMode?: string;
+  debugTrace?: ChatDebugTrace | null;
 };
 
 const EMPTY_STATE_SUGGESTIONS = [
@@ -78,15 +79,6 @@ function canChat(thread: ThreadRecord | null, documents: ThreadDocumentRecord[])
   return documents.some((document) => document.stages?.stage3?.status === "completed");
 }
 
-function getDocumentLabel(
-  documentId: string | undefined,
-  documents: ThreadDocumentRecord[],
-): string {
-  const resolvedId = String(documentId || "").trim();
-  const matched = documents.find((document) => document.document_id === resolvedId);
-  return matched?.original_filename || resolvedId || "문서";
-}
-
 function hasPendingInterrupt(messages: ChatMessage[]): boolean {
   const lastMessage = messages[messages.length - 1];
   return lastMessage?.role === "assistant" && lastMessage.kind === "interrupt";
@@ -98,8 +90,29 @@ function hydratePersistedMessages(records: ThreadChatHistoryMessage[]): ChatMess
     role: record.role,
     content: record.content,
     kind: record.kind,
-    createdAt: null,
+    createdAt: record.created_at || null,
+    citations: record.citations,
+    evidenceChunks: record.evidence_chunks,
+    retrievalMode: record.retrieval_mode || undefined,
+    debugTrace: record.debug_trace,
   }));
+}
+
+function formatChatBubbleTime(value?: string | null): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  return new Intl.DateTimeFormat("ko-KR", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(date);
 }
 
 function ThreadPanelIcon(props: { open: boolean }) {
@@ -110,6 +123,21 @@ function ThreadPanelIcon(props: { open: boolean }) {
         fill="none"
         stroke="currentColor"
         strokeLinecap="round"
+        strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
+function SendArrowIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        d="M12 5v14m0-14 5 5m-5-5-5 5"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
         strokeWidth="2"
       />
     </svg>
@@ -134,6 +162,10 @@ export function ChatPage() {
   const [appendFile, setAppendFile] = useState<File | null>(null);
   const [uploadingDocument, setUploadingDocument] = useState(false);
   const [deletingThreadId, setDeletingThreadId] = useState<string | null>(null);
+  const [liveProgressIndex, setLiveProgressIndex] = useState(0);
+  const transcriptRef = useRef<HTMLElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const chatReady = canChat(thread, documents);
 
   const sortedDocuments = useMemo(
     () =>
@@ -198,13 +230,60 @@ export function ChatPage() {
     };
   }, [navigate, threadId]);
 
-  const chatReady = canChat(thread, documents);
+  useEffect(() => {
+    if (!sending) {
+      setLiveProgressIndex(0);
+      return;
+    }
+
+    setLiveProgressIndex(0);
+    const timer = window.setInterval(() => {
+      setLiveProgressIndex((current) => Math.min(current + 1, 4));
+    }, 1200);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [sending]);
+
+  useEffect(() => {
+    const node = transcriptRef.current;
+    if (!node) {
+      return;
+    }
+    node.scrollTop = node.scrollHeight;
+  }, [messages, loading]);
+
+  function resizeComposer() {
+    const node = textareaRef.current;
+    if (!node) {
+      return;
+    }
+    node.style.height = "0px";
+    node.style.height = `${Math.min(node.scrollHeight, 220)}px`;
+  }
+
+  useEffect(() => {
+    resizeComposer();
+  }, [inputValue, pendingInterrupt, chatReady]);
+
+  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter") {
+      return;
+    }
+    if (event.shiftKey) {
+      return;
+    }
+    event.preventDefault();
+    void handleSendMessage();
+  }
 
   async function handleSendMessage() {
     const trimmed = inputValue.trim();
     if (!trimmed || !threadId || sending || !chatReady) {
       return;
     }
+    const activeThreadId = threadId;
 
     const userMessage: ChatMessage = {
       id: `${Date.now()}-user`,
@@ -213,53 +292,79 @@ export function ChatPage() {
       kind: "answer",
       createdAt: new Date().toISOString(),
     };
+    const pendingMessageId = `${Date.now()}-assistant-pending`;
+    const pendingMessage: ChatMessage = {
+      id: pendingMessageId,
+      role: "assistant",
+      content: "질문을 해석하고 답변을 준비하고 있습니다.",
+      kind: "pending",
+      createdAt: new Date().toISOString(),
+    };
 
-    setMessages((current) => [...current, userMessage]);
+    setMessages((current) => [...current, userMessage, pendingMessage]);
     setInputValue("");
     setSending(true);
     setErrorMessage(null);
 
     try {
-      const response = await sendThreadChatMessage(threadId, {
+      const response = await sendThreadChatMessage(activeThreadId, {
         message: trimmed,
         resume: pendingInterrupt,
       });
       const result = response.result;
 
-      const assistantContent =
-        result.status === "interrupted"
-          ? [result.interrupt?.question, result.interrupt?.reason]
-              .filter(Boolean)
-              .join("\n\n")
-          : result.final_answer || "답변을 생성하지 못했습니다.";
+      try {
+        await loadThreadChatView(activeThreadId);
+      } catch {
+        const assistantContent =
+          result.status === "interrupted"
+            ? [result.interrupt?.question, result.interrupt?.reason]
+                .filter(Boolean)
+                .join("\n\n")
+            : result.final_answer || "답변을 생성하지 못했습니다.";
+        const debugTrace =
+          result.debug_trace ||
+          (result.logs?.length || result.retrieval_mode
+            ? {
+                logs: result.logs,
+                retrieval_mode: result.retrieval_mode || null,
+              }
+            : null);
 
-      const assistantMessage: ChatMessage = {
-        id: `${Date.now()}-assistant`,
-        role: "assistant",
-        content: assistantContent,
-        kind: result.status === "interrupted" ? "interrupt" : "answer",
-        createdAt: new Date().toISOString(),
-        citations: result.citations,
-        evidenceChunks: result.evidence_chunks,
-        visualAssets: result.visual_assets,
-        retrievalMode: result.retrieval_mode,
-      };
+        const assistantMessage: ChatMessage = {
+          id: pendingMessageId,
+          role: "assistant",
+          content: assistantContent,
+          kind: result.status === "interrupted" ? "interrupt" : "answer",
+          createdAt: new Date().toISOString(),
+          citations: result.citations,
+          evidenceChunks: result.evidence_chunks,
+          visualAssets: result.visual_assets,
+          retrievalMode: result.retrieval_mode,
+          debugTrace,
+        };
 
-      setMessages((current) => [...current, assistantMessage]);
-      setPendingInterrupt(result.status === "interrupted");
+        setMessages((current) =>
+          current.map((message) => (message.id === pendingMessageId ? assistantMessage : message)),
+        );
+        setPendingInterrupt(result.status === "interrupted");
+      }
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "채팅 요청에 실패했습니다.";
       setErrorMessage(message);
       setMessages((current) => [
-        ...current,
-        {
-          id: `${Date.now()}-error`,
-          role: "assistant",
-          content: message,
-          kind: "error",
-          createdAt: new Date().toISOString(),
-        },
+        ...current.map((item) =>
+          item.id === pendingMessageId
+            ? {
+                id: pendingMessageId,
+                role: "assistant" as const,
+                content: message,
+                kind: "error" as const,
+                createdAt: new Date().toISOString(),
+              }
+            : item,
+        ),
       ]);
     } finally {
       setSending(false);
@@ -340,20 +445,15 @@ export function ChatPage() {
         selectedThreadId={threadId}
         onSelectThread={(nextThreadId) => navigate(`/threads/${encodeURIComponent(nextThreadId)}/chat`)}
         onCreateThread={() => navigate("/")}
-        onRefresh={() => void loadThreadChatView(threadId).catch(() => undefined)}
         onDeleteThread={(targetThreadId) => void handleDeleteThread(targetThreadId)}
         deletingThreadId={deletingThreadId}
       />
 
-      <main className="chat-main chat-main--refined">
+      <main className="chat-main--refined">
         <header className="chat-header chat-header--minimal">
           <div className="chat-header-copy">
-            <p className="eyebrow">Thread</p>
             <div className="chat-header-title-row">
               <h2>{thread?.thread_name || "채팅방"}</h2>
-              <span className={`room-status-chip room-status-${getThreadLifecycleTone(thread)}`}>
-                {getThreadLifecycleLabel(thread)}
-              </span>
             </div>
           </div>
 
@@ -375,7 +475,7 @@ export function ChatPage() {
         ) : null}
 
         <section className={`chat-body-grid ${showThreadPanel ? "has-panel" : ""}`}>
-          <section className="chat-transcript">
+          <section ref={transcriptRef} className="chat-transcript">
             {loading ? (
               <div className="empty-state">채팅 스레드를 불러오는 중입니다.</div>
             ) : messages.length === 0 ? (
@@ -408,7 +508,10 @@ export function ChatPage() {
                 ) : null}
               </div>
             ) : (
-              messages.map((message) => (
+              messages.map((message) => {
+                const formattedTime = formatChatBubbleTime(message.createdAt);
+
+                return (
                 <article
                   key={message.id}
                   className={`chat-bubble chat-bubble-${message.role} ${
@@ -417,15 +520,25 @@ export function ChatPage() {
                 >
                   <div className="chat-bubble-meta">
                     <strong>{message.role === "user" ? "나" : "Doc Chat"}</strong>
-                    {message.createdAt ? (
-                      <span>{new Date(message.createdAt).toLocaleTimeString()}</span>
-                    ) : null}
                   </div>
                   <div className="chat-bubble-content">
                     {message.content.split("\n").map((line, index) => (
                       <p key={`${message.id}-${index}`}>{line || "\u00a0"}</p>
                     ))}
                   </div>
+                  {formattedTime ? (
+                    <div className="chat-bubble-footer">
+                      <span className="chat-bubble-time">{formattedTime}</span>
+                    </div>
+                  ) : null}
+
+                  {message.kind === "pending" ? (
+                    <ChatTraceDetails
+                      pending
+                      liveProgressIndex={liveProgressIndex}
+                      documents={documents}
+                    />
+                  ) : null}
 
                   {message.visualAssets && message.visualAssets.length > 0 ? (
                     <div className="chat-visual-grid">
@@ -450,46 +563,31 @@ export function ChatPage() {
                     </div>
                   ) : null}
 
-                  {message.citations && message.citations.length > 0 ? (
+                  {message.kind !== "pending" &&
+                  ((message.citations && message.citations.length > 0) || message.debugTrace) ? (
                     <div className="chat-citation-summary">
-                      <span className="detail-chip">근거 {message.citations.length}개</span>
+                      {message.citations && message.citations.length > 0 ? (
+                        <span className="detail-chip">근거 {message.citations.length}개</span>
+                      ) : null}
                       {message.retrievalMode ? (
                         <span className="detail-chip detail-chip-muted">
-                          {message.retrievalMode}
+                          실행 {message.retrievalMode}
                         </span>
                       ) : null}
                     </div>
                   ) : null}
 
-                  {message.evidenceChunks && message.evidenceChunks.length > 0 ? (
-                    <details className="chat-evidence-details">
-                      <summary className="chat-evidence-summary">
-                        <div>
-                          <strong>텍스트 근거</strong>
-                          <span>{message.evidenceChunks.length}개 청크</span>
-                        </div>
-                      </summary>
-                      <div className="chat-evidence-grid">
-                        {message.evidenceChunks.map((chunk, index) => (
-                          <article
-                            key={`${message.id}-evidence-${chunk.chunk_id}-${index}`}
-                            className="chat-evidence-card"
-                          >
-                            <div className="chat-evidence-meta">
-                              <strong>{getDocumentLabel(chunk.document_id, documents)}</strong>
-                              <span>
-                                {chunk.page ? `p.${chunk.page}` : "page ?"}
-                                {chunk.section_title ? ` · ${chunk.section_title}` : ""}
-                              </span>
-                            </div>
-                            <p>{chunk.text_excerpt}</p>
-                          </article>
-                        ))}
-                      </div>
-                    </details>
+                  {message.kind !== "pending" ? (
+                    <ChatTraceDetails
+                      debugTrace={message.debugTrace}
+                      evidenceChunks={message.evidenceChunks}
+                      documents={documents}
+                      retrievalMode={message.retrievalMode}
+                    />
                   ) : null}
                 </article>
-              ))
+                );
+              })
             )}
           </section>
 
@@ -509,11 +607,7 @@ export function ChatPage() {
                   </div>
                   <div className="review-stat-card">
                     <strong>{thread?.default_retrieval_mode || "dense"}</strong>
-                    <span>검색 모드</span>
-                  </div>
-                  <div className="review-stat-card">
-                    <strong>{getThreadLifecycleLabel(thread)}</strong>
-                    <span>채팅 상태</span>
+                    <span>저장된 스레드 설정</span>
                   </div>
                 </div>
               </section>
@@ -614,36 +708,37 @@ export function ChatPage() {
           ) : null}
         </section>
 
-        <footer className="chat-composer chat-composer--refined">
-          <textarea
-            className="chat-input"
-            value={inputValue}
-            onChange={(event) => setInputValue(event.target.value)}
-            placeholder={
-              !chatReady
-                ? "검수와 stage3가 끝나면 이 자리에서 질문할 수 있습니다."
-                : pendingInterrupt
-                  ? "추가 정보를 입력하면 같은 질문 흐름으로 재개됩니다."
-                  : "문서에 대해 질문하세요."
-            }
-            disabled={sending || !chatReady}
-            rows={4}
-          />
-          <div className="chat-composer-actions">
-            <span className="muted-text">
-              {!chatReady
-                ? "채팅 준비 필요"
-                : pendingInterrupt
-                  ? "추가 정보 응답 모드"
-                  : "현재 스레드 문서 범위 검색"}
-            </span>
-            <button
-              className="primary-button"
-              onClick={() => void handleSendMessage()}
-              disabled={sending || !inputValue.trim() || !chatReady}
-            >
-              {sending ? "전송 중..." : pendingInterrupt ? "응답 보내기" : "질문하기"}
-            </button>
+        <footer className="chat-composer--refined">
+          <div className="chat-composer-shell">
+            <textarea
+              ref={textareaRef}
+              className="chat-input"
+              value={inputValue}
+              onChange={(event) => setInputValue(event.target.value)}
+              onKeyDown={handleComposerKeyDown}
+              placeholder={
+                !chatReady
+                  ? "검수와 stage3가 끝나면 질문할 수 있습니다."
+                  : pendingInterrupt
+                    ? "추가 정보를 입력하고 Enter로 보내세요."
+                    : "문서에 대해 질문하세요."
+              }
+              disabled={sending || !chatReady}
+              rows={1}
+            />
+            <div className="chat-composer-actions">
+              <span className="muted-text chat-composer-hint">
+                Enter 전송 · Shift+Enter 줄바꿈
+              </span>
+              <button
+                className="chat-send-button"
+                onClick={() => void handleSendMessage()}
+                disabled={sending || !inputValue.trim() || !chatReady}
+                aria-label={sending ? "전송 중" : pendingInterrupt ? "응답 보내기" : "질문 보내기"}
+              >
+                <SendArrowIcon />
+              </button>
+            </div>
           </div>
         </footer>
       </main>

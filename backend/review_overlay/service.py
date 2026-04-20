@@ -7,9 +7,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, TypedDict
 
+from backend.app_db import sync_document_profile_snapshot
 from backend.document_store import (
     DocumentPaths,
     build_document_paths,
+    load_document_record,
     update_document_stage_record,
 )
 from backend.stage2_preprocess.utils import (
@@ -357,6 +359,7 @@ def _render_reviewed_preview_html(elements: list[dict[str, Any]]) -> str:
 def apply_review_overlay(document_id: str) -> dict[str, Any]:
     """saved review decisions를 반영해 reviewed 산출물을 생성한다."""
     paths = build_document_paths(document_id)
+    document_record = load_document_record(document_id)
     cleaned_document = _load_cleaned_document(paths)
     decisions = load_review_decisions(document_id)
     elements = list(cleaned_document.get("elements") or [])
@@ -380,25 +383,49 @@ def apply_review_overlay(document_id: str) -> dict[str, Any]:
     safe_write_json(paths.reviewed_cleaned_json, reviewed_cleaned_payload)
     safe_write_text(paths.reviewed_cleaned_md, reviewed_markdown)
     safe_write_text(paths.reviewed_preview_html, reviewed_preview_html)
-    update_document_stage_record(
-        document_id=document_id,
-        stage="review",
-        status="completed",
-        outputs={
-            "review_decisions_path": str(paths.review_decisions_json),
-            "reviewed_cleaned_json": str(paths.reviewed_cleaned_json),
-            "reviewed_cleaned_md": str(paths.reviewed_cleaned_md),
-            "reviewed_preview_html": str(paths.reviewed_preview_html),
-        },
-    )
+    output_paths = {
+        "review_decisions_path": str(paths.review_decisions_json),
+        "reviewed_cleaned_json": str(paths.reviewed_cleaned_json),
+        "reviewed_cleaned_md": str(paths.reviewed_cleaned_md),
+        "reviewed_preview_html": str(paths.reviewed_preview_html),
+    }
+    try:
+        sync_document_profile_snapshot(
+            document_id=document_id,
+            original_filename=str(
+                document_record.get("original_filename") or f"{document_id}.pdf"
+            ).strip()
+            or f"{document_id}.pdf",
+            normalized_filename=str(
+                document_record.get("normalized_filename")
+                or document_record.get("original_filename")
+                or f"{document_id}.pdf"
+            ).strip()
+            or f"{document_id}.pdf",
+            storage_root=paths.root,
+            source_pdf_path=str(paths.source_pdf) if paths.source_pdf.exists() else None,
+            raw_profile=dict(reviewed_cleaned_payload.get("document_profile") or {}),
+            elements=list(reviewed_cleaned_payload.get("elements") or []),
+            source_stage="review",
+        )
+        update_document_stage_record(
+            document_id=document_id,
+            stage="review",
+            status="completed",
+            outputs=output_paths,
+        )
+    except Exception as exc:
+        update_document_stage_record(
+            document_id=document_id,
+            stage="review",
+            status="failed",
+            error=str(exc),
+            outputs=output_paths,
+        )
+        raise
 
     return {
         "document_id": document_id,
         "stats": stats,
-        "output_paths": {
-            "review_decisions_path": str(paths.review_decisions_json),
-            "reviewed_cleaned_json": str(paths.reviewed_cleaned_json),
-            "reviewed_cleaned_md": str(paths.reviewed_cleaned_md),
-            "reviewed_preview_html": str(paths.reviewed_preview_html),
-        },
+        "output_paths": output_paths,
     }

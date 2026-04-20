@@ -9,6 +9,7 @@ from typing import Any
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnableLambda
 
+from backend.app_db import try_load_thread_runtime_context
 from backend.common import derive_document_id_from_artifact_path
 from backend.thread_identity import build_thread_collection_name
 from backend.stage3_chunking.embeddings import OpenAIEmbeddingClient
@@ -554,6 +555,11 @@ def run_stage4_retrieval(
             cleaned_json_path or chunks_json_path
         )
     collection_name = str(resolved_inputs.get("collection_name") or "").strip() or None
+    if not collection_name and thread_id:
+        runtime_context = try_load_thread_runtime_context(thread_id)
+        collection_name = str(
+            (runtime_context or {}).get("collection_name") or ""
+        ).strip() or None
     if not collection_name and thread_id:
         collection_name = build_thread_collection_name(thread_id)
     if not collection_name:

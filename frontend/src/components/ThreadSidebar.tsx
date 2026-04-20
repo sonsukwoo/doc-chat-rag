@@ -1,4 +1,3 @@
-import { getThreadLifecycleLabel, getThreadLifecycleTone } from "../lib/threadUi";
 import type { ThreadRecord } from "../types";
 
 type ThreadSidebarProps = {
@@ -6,7 +5,6 @@ type ThreadSidebarProps = {
   selectedThreadId: string | null;
   onSelectThread: (threadId: string) => void;
   onCreateThread: () => void;
-  onRefresh?: () => void;
   onDeleteThread?: (threadId: string) => void;
   deletingThreadId?: string | null;
 };
@@ -31,7 +29,6 @@ export function ThreadSidebar({
   selectedThreadId,
   onSelectThread,
   onCreateThread,
-  onRefresh,
   onDeleteThread,
   deletingThreadId,
 }: ThreadSidebarProps) {
@@ -41,8 +38,6 @@ export function ThreadSidebar({
         <div className="workspace-brand-mark">DC</div>
         <div>
           <p className="eyebrow">Doc Chat</p>
-          <h1>문서 채팅</h1>
-          <p className="muted-text">스레드별로 문서와 검색 범위를 분리합니다.</p>
         </div>
       </div>
 
@@ -56,14 +51,6 @@ export function ThreadSidebar({
             <p className="eyebrow">Threads</p>
             <h2>채팅방</h2>
           </div>
-          {onRefresh ? (
-            <button
-              className="ghost-button thread-sidebar-refresh"
-              onClick={onRefresh}
-            >
-              새로고침
-            </button>
-          ) : null}
         </div>
 
         <div className="thread-list">
@@ -74,7 +61,6 @@ export function ThreadSidebar({
           ) : null}
 
           {threads.map((thread) => {
-            const tone = getThreadLifecycleTone(thread);
             const isActive = thread.thread_id === selectedThreadId;
             const isDeleting = deletingThreadId === thread.thread_id;
             return (
@@ -89,13 +75,10 @@ export function ThreadSidebar({
                 >
                   <div className="thread-list-item-top">
                     <strong>{thread.thread_name}</strong>
-                    <span className={`thread-list-status thread-list-status-${tone}`}>
-                      {getThreadLifecycleLabel(thread)}
-                    </span>
                   </div>
                   <div className="thread-list-item-meta">
                     <span>{thread.document_count} docs</span>
-                    <span>{thread.default_retrieval_mode}</span>
+                    <span>설정 {thread.default_retrieval_mode}</span>
                   </div>
                 </button>
 
