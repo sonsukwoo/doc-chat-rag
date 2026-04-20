@@ -11,12 +11,21 @@ from .config import (
     build_app_uri,
     build_checkpoint_uri,
 )
-from .repositories import ChatRepository, DocumentRepository, app_db_connection
+from .repositories import (
+    ChatRepository,
+    CheckpointRepository,
+    DocumentRepository,
+    app_db_connection,
+)
 from .services import (
-    RoomRuntimeContext,
-    load_room_runtime_context,
+    ExpandedContextBlockPayload,
+    ThreadRuntimeContext,
+    VisualAssetPayload,
+    load_expanded_context_blocks,
+    load_thread_runtime_context,
+    load_visual_assets,
     sync_document_runtime_metadata,
-    try_load_room_runtime_context,
+    try_load_thread_runtime_context,
 )
 
 __all__ = [
@@ -31,9 +40,14 @@ __all__ = [
     "build_checkpoint_uri",
     "app_db_connection",
     "ChatRepository",
+    "CheckpointRepository",
     "DocumentRepository",
-    "RoomRuntimeContext",
-    "load_room_runtime_context",
-    "try_load_room_runtime_context",
+    "ExpandedContextBlockPayload",
+    "ThreadRuntimeContext",
+    "VisualAssetPayload",
+    "load_expanded_context_blocks",
+    "load_thread_runtime_context",
+    "load_visual_assets",
+    "try_load_thread_runtime_context",
     "sync_document_runtime_metadata",
 ]

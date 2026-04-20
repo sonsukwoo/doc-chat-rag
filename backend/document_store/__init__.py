@@ -10,6 +10,7 @@ from .service import (
     list_document_records,
     load_document_record,
     save_uploaded_pdf,
+    sanitize_document_id,
     sync_document_record,
     update_document_stage_record,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "list_document_records",
     "load_document_record",
     "save_uploaded_pdf",
+    "sanitize_document_id",
     "sync_document_record",
     "update_document_stage_record",
 ]

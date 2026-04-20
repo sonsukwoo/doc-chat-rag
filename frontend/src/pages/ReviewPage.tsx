@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { PreviewPane } from "../components/PreviewPane";
 import {
   applyReview,
+  finalizeThreadDocumentReview,
   getDocument,
   getReviewSource,
   runStage,
@@ -80,7 +81,8 @@ function getElementById(
 }
 
 export function ReviewPage() {
-  const { documentId = "" } = useParams();
+  const navigate = useNavigate();
+  const { threadId, documentId = "" } = useParams();
   const [documentInfo, setDocumentInfo] = useState<DocumentRecord | null>(null);
   const [reviewSource, setReviewSource] = useState<ReviewSourceResponse | null>(null);
   const [decisions, setDecisions] = useState<ReviewDecisionsPayload>({
@@ -93,6 +95,7 @@ export function ReviewPage() {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [finalized, setFinalized] = useState(false);
 
   useEffect(() => {
     if (!documentId) {
@@ -110,6 +113,7 @@ export function ReviewPage() {
         setDecisions(reviewResponse.review_decisions);
         setQueuedDropIds([]);
         setReviewPhase("edit");
+        setFinalized(false);
         setSelectedElementId(reviewResponse.elements[0]?.id ?? null);
       } catch (error) {
         setErrorMessage(
@@ -285,11 +289,20 @@ export function ReviewPage() {
     setSuccessMessage(null);
     try {
       await saveReviewDecisions(documentId, decisions);
-      await applyReview(documentId);
-      await runStage(documentId, "stage3");
+      if (threadId) {
+        await finalizeThreadDocumentReview(threadId, documentId);
+      } else {
+        await applyReview(documentId);
+        await runStage(documentId, "stage3");
+      }
       const updatedDocument = await getDocument(documentId);
       setDocumentInfo(updatedDocument.document);
-      setSuccessMessage("stage3까지 진행했습니다.");
+      setFinalized(true);
+      setSuccessMessage(
+        threadId
+          ? "검수를 확정하고 채팅 준비 상태까지 완료했습니다."
+          : "stage3까지 진행했습니다.",
+      );
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "stage3 실행에 실패했습니다.");
     } finally {
@@ -309,15 +322,25 @@ export function ReviewPage() {
   }
 
   return (
-    <div className="review-page-shell">
-      <header className="review-topbar">
-        <div>
-          <Link className="back-link" to="/">
-            문서 목록으로
+    <div className="review-page-shell review-page-shell--chat">
+      <header className="review-topbar review-topbar--chat">
+        <div className="review-topbar-copy">
+          <Link
+            className="back-link"
+            to={threadId ? `/threads/${encodeURIComponent(threadId)}/chat` : "/"}
+          >
+            {threadId ? "채팅으로" : "워크스페이스로"}
           </Link>
-          <h1>{documentInfo?.original_filename || reviewSource.document_id}</h1>
+          <div className="review-title-row">
+            <h1>{documentInfo?.original_filename || reviewSource.document_id}</h1>
+            <span className="detail-chip">
+              {reviewPhase === "preview" ? "preview mode" : "edit mode"}
+            </span>
+          </div>
           <p className="muted-text">
-            가운데 문서형 preview에서 요소를 한 번 클릭하면 장바구니에 담깁니다. 제거 미리보기를 확인한 뒤 확정하면 됩니다.
+            {threadId
+              ? `thread ${threadId}에서 열린 검수 화면입니다. 문서 캔버스에서 요소를 한 번 클릭하면 장바구니에 담기고, 확정 후 채팅 준비 상태로 넘어갑니다.`
+              : "문서 캔버스에서 요소를 한 번 클릭하면 장바구니에 담깁니다. 제거 미리보기를 확인한 뒤 확정하면 됩니다."}
           </p>
         </div>
         <div className="review-topbar-actions">
@@ -330,7 +353,11 @@ export function ReviewPage() {
                 {busyAction === "apply" ? "반영 중..." : "검수 반영"}
               </button>
               <button className="primary-button" onClick={() => void handleRunStage3()} disabled={!canPersist}>
-                {busyAction === "stage3" ? "진행 중..." : "다음 단계 진행"}
+                {busyAction === "stage3"
+                  ? "진행 중..."
+                  : threadId
+                    ? "검수 확정 후 채팅 준비"
+                    : "다음 단계 진행"}
               </button>
             </>
           ) : (
@@ -348,30 +375,34 @@ export function ReviewPage() {
 
       {errorMessage ? <div className="error-banner">{errorMessage}</div> : null}
       {successMessage ? <div className="success-banner">{successMessage}</div> : null}
+      {finalized && threadId ? (
+        <div className="success-banner review-finalized-banner">
+          <div>
+            <strong>이 문서는 현재 thread에서 검색 가능한 상태입니다.</strong>
+            <p className="muted-text">
+              지금은 워크스페이스로 돌아가 다른 문서를 계속 준비하거나, 이후 채팅 화면을 연결하면 바로 질문할 수 있습니다.
+            </p>
+          </div>
+          <button
+            className="primary-button"
+            onClick={() => navigate(`/threads/${encodeURIComponent(threadId)}/chat`)}
+          >
+            채팅으로 돌아가기
+          </button>
+        </div>
+      ) : null}
 
-      <div className="review-layout">
-        <PreviewPane
-          documentId={documentId}
-          elements={activeElements}
-          mode={reviewPhase}
-          queuedElementIds={queuedDropIds}
-          selectedElementId={selectedElementId}
-          onElementClick={(elementId) => {
-            if (reviewPhase === "edit") {
-              toggleQueuedElement(elementId);
-              return;
-            }
-            setSelectedElementId(elementId);
-          }}
-        />
-
-        <aside className="review-sidebar review-sidebar--cart">
-          <section className="sidebar-panel">
-            <div className="sidebar-panel-header">
-              <h2>검수 흐름</h2>
-              <p>{reviewPhase === "preview" ? "drop 미리보기" : "편집 중"}</p>
+      <div className="review-layout review-layout--chat">
+        <section className="review-main-column">
+          <section className="section-card review-summary-card">
+            <div className="section-card-header">
+              <div>
+                <p className="eyebrow">Review Summary</p>
+                <h2>현재 검수 상태</h2>
+              </div>
+              <span className="detail-chip">{reviewSource.document_id}</span>
             </div>
-            <div className="review-flow-stats">
+            <div className="review-summary-strip">
               <div className="review-stat-card">
                 <strong>{reviewSource.counts.total_elements}</strong>
                 <span>전체 요소</span>
@@ -384,14 +415,47 @@ export function ReviewPage() {
                 <strong>{queuedElements.length}</strong>
                 <span>장바구니</span>
               </div>
+              <div className="review-stat-card">
+                <strong>{reviewPhase === "preview" ? "preview" : "edit"}</strong>
+                <span>현재 모드</span>
+              </div>
             </div>
             <p className="panel-note">
               {reviewPhase === "edit"
-                ? "preview에서 hover 시 요소 경계가 보이고, 클릭하면 바로 장바구니에 담깁니다."
-                : "현재는 장바구니 요소를 제거한 결과만 보여줍니다. 마음에 들지 않으면 바로 이전 편집 상태로 돌아갈 수 있습니다."}
+                ? "문서 캔버스에서 바로 요소를 선택하고, 장바구니 미리보기로 제거 결과를 확인한 뒤 확정합니다."
+                : "현재는 장바구니 요소를 제거한 결과만 보여줍니다. 이상하면 바로 이전 편집 상태로 되돌릴 수 있습니다."}
+            </p>
+          </section>
+
+          <PreviewPane
+            documentId={documentId}
+            elements={activeElements}
+            mode={reviewPhase}
+            queuedElementIds={queuedDropIds}
+            selectedElementId={selectedElementId}
+            onElementClick={(elementId) => {
+              if (reviewPhase === "edit") {
+                toggleQueuedElement(elementId);
+                return;
+              }
+              setSelectedElementId(elementId);
+            }}
+          />
+        </section>
+
+        <aside className="review-sidebar review-sidebar--chat">
+          <section className="sidebar-panel review-action-panel">
+            <div className="sidebar-panel-header">
+              <h2>검수 액션</h2>
+              <p>{reviewPhase === "preview" ? "미리보기" : "편집 중"}</p>
+            </div>
+            <p className="panel-note">
+              {reviewPhase === "edit"
+                ? "문서형 캔버스에서 요소를 클릭하면 장바구니에 담깁니다. 저장은 서버에 decision만 기록하고, 다음 단계 진행 시 stage3까지 이어집니다."
+                : "현재는 장바구니 제거 결과를 보는 단계입니다. 괜찮으면 확정하고, 아니면 바로 이전 편집으로 돌아갑니다."}
             </p>
             {reviewPhase === "edit" ? (
-              <div className="detail-actions">
+              <div className="detail-actions detail-actions--stack">
                 <button
                   className="secondary-button"
                   onClick={enterPreviewMode}
@@ -408,7 +472,7 @@ export function ReviewPage() {
                 </button>
               </div>
             ) : (
-              <div className="detail-actions">
+              <div className="detail-actions detail-actions--stack">
                 <button className="ghost-button" onClick={returnToEditMode}>
                   이전 편집으로 돌아가기
                 </button>

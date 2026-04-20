@@ -54,6 +54,39 @@ def ensure_application_schemas() -> None:
         with conn.cursor() as cur:
             for statement in build_schema_ddl():
                 cur.execute(statement)
+            _ensure_document_parent_primary_key(cur)
+
+
+def _ensure_document_parent_primary_key(cursor: Any) -> None:
+    """document_parents PK를 document-scoped 복합키로 보정한다."""
+    cursor.execute(
+        """
+        SELECT kcu.column_name
+        FROM information_schema.table_constraints AS tc
+        JOIN information_schema.key_column_usage AS kcu
+          ON tc.constraint_schema = kcu.constraint_schema
+         AND tc.constraint_name = kcu.constraint_name
+        WHERE tc.table_schema = %s
+          AND tc.table_name = 'document_parents'
+          AND tc.constraint_type = 'PRIMARY KEY'
+        ORDER BY kcu.ordinal_position
+        """,
+        (APP_DOC_SCHEMA,),
+    )
+    primary_key_columns = [
+        str(row["column_name"])
+        for row in cursor.fetchall()
+        if row.get("column_name")
+    ]
+    if primary_key_columns == ["document_id", "parent_id"]:
+        return
+
+    table_name = f'"{APP_DOC_SCHEMA}"."document_parents"'
+    cursor.execute(f"ALTER TABLE {table_name} ALTER COLUMN parent_id SET NOT NULL")
+    cursor.execute(f"ALTER TABLE {table_name} DROP CONSTRAINT IF EXISTS document_parents_pkey")
+    cursor.execute(
+        f"ALTER TABLE {table_name} ADD CONSTRAINT document_parents_pkey PRIMARY KEY (document_id, parent_id)"
+    )
 
 
 def ensure_checkpoint_schema() -> None:

@@ -1,7 +1,7 @@
 """Stage-5 chatbot tools.
 
 ToolNode에 연결할 툴 집합이다.
-room/document 범위는 모델 인자가 아니라 runtime.state에서 읽는다.
+thread/document 범위는 모델 인자가 아니라 runtime.state에서 읽는다.
 """
 
 from __future__ import annotations
@@ -12,15 +12,16 @@ from typing import Any
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.tools import BaseTool
+from backend.thread_identity import build_thread_collection_name
 
 
-def build_list_room_documents_tool(
+def build_list_thread_documents_tool(
 ) -> BaseTool:
-    """현재 room에 연결된 문서 목록 조회 툴을 만든다."""
+    """현재 thread에 연결된 문서 목록 조회 툴을 만든다."""
 
-    @tool("list_room_documents")
-    def list_room_documents(runtime: ToolRuntime) -> str:
-        """현재 채팅방에 연결된 문서 ID 목록을 반환합니다."""
+    @tool("list_thread_documents")
+    def list_thread_documents(runtime: ToolRuntime) -> str:
+        """현재 스레드에 연결된 문서 ID 목록을 반환합니다."""
         state = dict(runtime.state or {})
         document_ids = [
             str(item)
@@ -28,32 +29,34 @@ def build_list_room_documents_tool(
             if str(item)
         ]
         if not document_ids:
-            return "현재 채팅방에 연결된 문서가 없습니다."
+            return "현재 스레드에 연결된 문서가 없습니다."
         return json.dumps(
             {"document_ids": document_ids},
             ensure_ascii=False,
         )
 
-    return list_room_documents
+    return list_thread_documents
 
 
-def build_search_room_knowledge_tool(
+def build_search_thread_knowledge_tool(
     *,
     stage4_runner: Callable[..., dict[str, Any]] | None = None,
 ) -> BaseTool:
-    """현재 room 범위 검색 툴을 만든다."""
+    """현재 thread 범위 검색 툴을 만든다."""
 
-    @tool("search_room_knowledge")
-    def search_room_knowledge(query: str, runtime: ToolRuntime) -> str:
-        """현재 채팅방 범위에서 관련 문서를 검색합니다."""
+    @tool("search_thread_knowledge")
+    def search_thread_knowledge(query: str, runtime: ToolRuntime) -> str:
+        """현재 스레드 범위에서 관련 문서를 검색합니다."""
         state = dict(runtime.state or {})
-        resolved_room_id = str(state.get("room_id") or "").strip()
+        resolved_thread_id = str(state.get("thread_id") or "").strip()
         document_ids = [
             str(item)
             for item in state.get("active_document_ids") or []
             if str(item)
         ]
         collection_name = str(state.get("collection_name") or "").strip() or None
+        if collection_name is None and resolved_thread_id:
+            collection_name = build_thread_collection_name(resolved_thread_id)
         retrieval_policy = dict(state.get("retrieval_policy") or {})
         retrieval_mode = str(retrieval_policy.get("mode") or "dense").strip() or "dense"
 
@@ -62,7 +65,7 @@ def build_search_room_knowledge_tool(
                 {
                     "status": "scaffold_only",
                     "message": "stage4 retrieval integration pending",
-                    "room_id": resolved_room_id,
+                    "thread_id": resolved_thread_id,
                     "document_ids": document_ids,
                     "query": query,
                 },
@@ -71,22 +74,47 @@ def build_search_room_knowledge_tool(
 
         result = stage4_runner(
             query=query,
-            room_id=resolved_room_id,
+            thread_id=resolved_thread_id,
             active_document_ids=document_ids,
             collection_name=collection_name,
             retrieval_mode=retrieval_mode,
         )
         return json.dumps(result, ensure_ascii=False)
 
-    return search_room_knowledge
+    return search_thread_knowledge
 
-
-def build_expand_context_window_tool() -> BaseTool:
-    """window/parent 확장 툴 스캐폴드를 만든다."""
+def build_expand_context_window_tool(
+    *,
+    context_window_loader: Callable[..., list[dict[str, Any]]] | None = None,
+) -> BaseTool:
+    """window/parent 확장 툴을 만든다."""
 
     @tool("expand_context_window")
-    def expand_context_window(chunk_ids: list[str]) -> str:
+    def expand_context_window(chunk_ids: list[str], runtime: ToolRuntime) -> str:
         """검색된 child chunk 기준으로 인접 문맥을 확장합니다."""
+        state = dict(runtime.state or {})
+        resolved_thread_id = str(state.get("thread_id") or "").strip() or None
+        document_ids = [
+            str(item)
+            for item in state.get("active_document_ids") or []
+            if str(item)
+        ]
+        window_size = 1
+        if callable(context_window_loader):
+            blocks = context_window_loader(
+                thread_id=resolved_thread_id,
+                active_document_ids=document_ids,
+                chunk_ids=chunk_ids,
+                window_size=window_size,
+            )
+            return json.dumps(
+                {
+                    "status": "completed",
+                    "chunk_ids": chunk_ids,
+                    "blocks": blocks,
+                },
+                ensure_ascii=False,
+            )
         return json.dumps(
             {
                 "status": "scaffold_only",
@@ -99,12 +127,36 @@ def build_expand_context_window_tool() -> BaseTool:
     return expand_context_window
 
 
-def build_load_visual_asset_tool() -> BaseTool:
-    """표/이미지 asset 조회 툴 스캐폴드를 만든다."""
+def build_load_visual_asset_tool(
+    *,
+    visual_asset_loader: Callable[..., list[dict[str, Any]]] | None = None,
+) -> BaseTool:
+    """표/이미지 asset 조회 툴을 만든다."""
 
     @tool("load_visual_asset")
-    def load_visual_asset(asset_ref: str) -> str:
+    def load_visual_asset(asset_ref: str, runtime: ToolRuntime) -> str:
         """표/이미지 원본 asset 메타데이터를 불러옵니다."""
+        state = dict(runtime.state or {})
+        resolved_thread_id = str(state.get("thread_id") or "").strip() or None
+        document_ids = [
+            str(item)
+            for item in state.get("active_document_ids") or []
+            if str(item)
+        ]
+        if callable(visual_asset_loader):
+            assets = visual_asset_loader(
+                thread_id=resolved_thread_id,
+                active_document_ids=document_ids,
+                asset_refs=[asset_ref],
+            )
+            return json.dumps(
+                {
+                    "status": "completed",
+                    "asset_ref": asset_ref,
+                    "asset": assets[0] if assets else None,
+                },
+                ensure_ascii=False,
+            )
         return json.dumps(
             {
                 "status": "scaffold_only",
@@ -148,14 +200,20 @@ def build_stage5_tools(
     *,
     allow_web_search: bool = False,
     stage4_runner: Callable[..., dict[str, Any]] | None = None,
+    context_window_loader: Callable[..., list[dict[str, Any]]] | None = None,
+    visual_asset_loader: Callable[..., list[dict[str, Any]]] | None = None,
 ) -> list[BaseTool]:
     """stage5 graph에 연결할 기본 툴 목록을 구성한다."""
     return [
-        build_list_room_documents_tool(),
-        build_search_room_knowledge_tool(
+        build_list_thread_documents_tool(),
+        build_search_thread_knowledge_tool(
             stage4_runner=stage4_runner,
         ),
-        build_expand_context_window_tool(),
-        build_load_visual_asset_tool(),
+        build_expand_context_window_tool(
+            context_window_loader=context_window_loader,
+        ),
+        build_load_visual_asset_tool(
+            visual_asset_loader=visual_asset_loader,
+        ),
         build_web_search_tool(enabled=allow_web_search),
     ]

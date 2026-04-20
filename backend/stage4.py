@@ -6,7 +6,7 @@ from backend.stage4_retrieval import (
     build_stage4_output_paths,
     main,
     run_stage4_retrieval,
-    search_room_knowledge,
+    search_thread_knowledge,
 )
 
 __all__ = [
@@ -14,7 +14,7 @@ __all__ = [
     "DEFAULT_PARENTS_JSON_PATH",
     "build_stage4_output_paths",
     "run_stage4_retrieval",
-    "search_room_knowledge",
+    "search_thread_knowledge",
     "main",
 ]
 

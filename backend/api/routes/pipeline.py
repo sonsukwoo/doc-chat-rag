@@ -8,7 +8,6 @@ from backend.document_store import build_document_paths, load_document_record
 from backend.services import (
     run_stage1_for_document,
     run_stage2_for_document,
-    run_stage3_for_document,
 )
 
 
@@ -47,7 +46,7 @@ def run_stage2(document_id: str) -> dict:
 
 @router.post("/{document_id}/stage3")
 def run_stage3(document_id: str) -> dict:
-    """cleaned 또는 reviewed_cleaned 결과를 기준으로 chunking/indexing을 수행한다."""
+    """문서 단독 stage3 실행은 더 이상 지원하지 않는다."""
     _ensure_document_exists(document_id)
     paths = build_document_paths(document_id)
     if not paths.stage2_cleaned_json.exists() and not paths.reviewed_cleaned_json.exists():
@@ -56,5 +55,10 @@ def run_stage3(document_id: str) -> dict:
             detail="stage2 result is missing; run stage2 before stage3",
         )
 
-    result = run_stage3_for_document(document_id)
-    return {"status": "completed", "result": result}
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "thread-scoped stage3 only supports the finalize-review flow. "
+            "Use /threads/{thread_id}/documents/{document_id}/finalize-review instead."
+        ),
+    )

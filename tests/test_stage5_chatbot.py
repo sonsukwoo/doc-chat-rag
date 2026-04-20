@@ -194,6 +194,142 @@ class Stage5ChatbotTests(unittest.TestCase):
         )
         self.assertEqual(len(result["citations"]), 1)
 
+    def test_run_stage5_chatbot_resolves_context_window_and_visual_assets(self):
+        def _fake_asset_stage4_runner(
+            *,
+            query,
+            room_id,
+            active_document_ids,
+            collection_name=None,
+            retrieval_mode=None,
+            **_,
+        ):
+            return {
+                "status": "completed",
+                "query": query,
+                "room_id": room_id,
+                "active_document_ids": list(active_document_ids),
+                "collection_name": collection_name,
+                "retrieval_mode": retrieval_mode or "dense",
+                "retrieved_count": 1,
+                "retrievals": [
+                    {
+                        "document_id": active_document_ids[0]
+                        if active_document_ids
+                        else "doc-1",
+                        "chunk_id": "figure-0001",
+                        "parent_id": "parent-1",
+                        "primary_page": 5,
+                        "section_title": "2. 결과",
+                        "asset_relative_path": "figures/page_5_figure_1.png",
+                        "text": "Figure summary text",
+                        "chunk_type": "figure",
+                        "score": 0.93,
+                    }
+                ],
+            }
+
+        def _fake_context_loader(*, room_id, active_document_ids, chunk_ids, window_size):
+            return [
+                {
+                    "document_id": active_document_ids[0],
+                    "parent_id": "parent-1",
+                    "section_title": "2. 결과",
+                    "page_start": 5,
+                    "page_end": 5,
+                    "heading_path": ["2. 결과"],
+                    "matched_chunk_ids": ["figure-0001"],
+                    "window_chunk_ids": ["text-0008", "figure-0001", "text-0009"],
+                    "context_text": "주변 문맥입니다.",
+                    "expansion_mode": "postgres_parent_window",
+                }
+            ]
+
+        def _fake_visual_asset_loader(*, room_id, active_document_ids, asset_refs):
+            return [
+                {
+                    "asset_ref": asset_refs[0],
+                    "document_id": active_document_ids[0],
+                    "chunk_id": "figure-0001",
+                    "asset_kind": "figure",
+                    "relative_path": "figures/page_5_figure_1.png",
+                    "asset_stage": "stage2",
+                    "page": 5,
+                    "caption": "테스트 그림",
+                    "summary_text": "Figure summary text",
+                    "heading_path": ["2. 결과"],
+                    "pages": [5],
+                }
+            ]
+
+        fake_llm = _FakeToolCallingModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "search_room_knowledge",
+                            "args": {"query": "그림 내용을 설명해줘"},
+                            "id": "tool-call-figure-search",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "expand_context_window",
+                            "args": {"chunk_ids": ["doc-1:figure-0001"]},
+                            "id": "tool-call-window",
+                            "type": "tool_call",
+                        },
+                        {
+                            "name": "load_visual_asset",
+                            "args": {"asset_ref": "doc-1:figure-0001"},
+                            "id": "tool-call-asset",
+                            "type": "tool_call",
+                        },
+                    ],
+                ),
+                AIMessage(content=""),
+            ],
+            structured_responses={
+                "GroundingCheckResult": {
+                    "enough_evidence": True,
+                    "needs_deeper_retrieval": False,
+                    "needs_clarification": False,
+                    "clarification_question": None,
+                    "missing_aspects": [],
+                },
+                "FinalAnswerResult": {
+                    "answer": "5페이지 그림은 결과 비교를 보여줍니다.",
+                    "grounded": True,
+                },
+            },
+        )
+
+        result = run_stage5_chatbot(
+            {
+                "room_id": "room-alpha",
+                "thread_id": "thread-asset",
+                "user_message": "그림 내용을 설명해줘",
+                "active_document_ids": ["doc-1"],
+                "collection_name": "rag_chat_hybrid",
+                "_context_window_loader": _fake_context_loader,
+                "_visual_asset_loader": _fake_visual_asset_loader,
+            },
+            checkpointer=InMemorySaver(),
+            llm=fake_llm,
+            stage4_runner=_fake_asset_stage4_runner,
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(result["citations"]), 1)
+        self.assertEqual(result["citations"][0]["asset_ref"], "doc-1:figure-0001")
+        self.assertEqual(len(result["visual_assets"]), 1)
+        self.assertEqual(result["visual_assets"][0]["relative_path"], "figures/page_5_figure_1.png")
+
     def test_run_stage5_chatbot_interrupts_when_grounding_llm_requests_clarification(self):
         fake_llm = _FakeToolCallingModel(
             [

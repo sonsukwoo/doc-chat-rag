@@ -10,6 +10,7 @@ from langchain_core.documents import Document
 from langchain_core.runnables import RunnableLambda
 
 from backend.common import derive_document_id_from_artifact_path
+from backend.thread_identity import build_thread_collection_name
 from backend.stage3_chunking.embeddings import OpenAIEmbeddingClient
 from backend.stage3_indexing.qdrant import QdrantRestClient
 
@@ -262,7 +263,7 @@ def _build_retriever(
     bm25_fetch_k: int,
     hybrid_rrf_weights: list[float] | None,
     bm25_excluded_role_hints: list[str],
-    room_id: str | None,
+    thread_id: str | None,
     document_id: str,
     active_document_ids: list[str],
     restrict_to_document: bool,
@@ -286,7 +287,7 @@ def _build_retriever(
         },
         rrf_weights=hybrid_rrf_weights,
         bm25_excluded_role_hints=bm25_excluded_role_hints,
-        room_id=room_id,
+        thread_id=thread_id,
         document_id=document_id,
         active_document_ids=active_document_ids,
         restrict_to_document=restrict_to_document,
@@ -302,7 +303,7 @@ def _build_base_output(
     output_dir: Path,
     output_paths: Stage4OutputPaths,
     document_id: str,
-    room_id: str | None,
+    thread_id: str | None,
     active_document_ids: list[str],
     collection_name: str,
     retrieval_mode: str,
@@ -333,7 +334,7 @@ def _build_base_output(
         ),
         "output_dir": str(output_dir),
         "document_id": document_id,
-        "room_id": room_id,
+        "thread_id": thread_id,
         "active_document_ids": active_document_ids,
         "collection_name": collection_name,
         "retrieval_mode": retrieval_mode,
@@ -361,7 +362,7 @@ def _build_base_output(
         "fetched_count": 0,
         "retrieved_count": 0,
         "qdrant_configured": qdrant_configured,
-        "room_filter_applied": bool(room_id),
+        "thread_filter_applied": bool(thread_id),
         "document_filter_applied": bool(
             restrict_to_document and (document_id or active_document_ids)
         ),
@@ -383,7 +384,7 @@ def _retrieve_documents_with_optional_score_fallback(
     bm25_fetch_k: int,
     hybrid_rrf_weights: list[float] | None,
     bm25_excluded_role_hints: list[str],
-    room_id: str | None,
+    thread_id: str | None,
     document_id: str,
     active_document_ids: list[str],
     restrict_to_document: bool,
@@ -402,7 +403,7 @@ def _retrieve_documents_with_optional_score_fallback(
         bm25_fetch_k=bm25_fetch_k,
         hybrid_rrf_weights=hybrid_rrf_weights,
         bm25_excluded_role_hints=bm25_excluded_role_hints,
-        room_id=room_id,
+        thread_id=thread_id,
         document_id=document_id,
         active_document_ids=active_document_ids,
         restrict_to_document=restrict_to_document,
@@ -428,7 +429,7 @@ def _retrieve_documents_with_optional_score_fallback(
             bm25_fetch_k=bm25_fetch_k,
             hybrid_rrf_weights=hybrid_rrf_weights,
             bm25_excluded_role_hints=bm25_excluded_role_hints,
-            room_id=room_id,
+            thread_id=thread_id,
             document_id=document_id,
             active_document_ids=active_document_ids,
             restrict_to_document=restrict_to_document,
@@ -539,7 +540,7 @@ def run_stage4_retrieval(
     chunk_lookup = build_chunk_lookup(chunks_document)
 
     explicit_document_id = resolved_inputs.get("document_id")
-    room_id = str(resolved_inputs.get("room_id") or "").strip() or None
+    thread_id = str(resolved_inputs.get("thread_id") or "").strip() or None
     active_document_ids = [
         str(item).strip()
         for item in resolved_inputs.get("active_document_ids") or []
@@ -552,10 +553,11 @@ def run_stage4_retrieval(
         document_id = derive_document_id_from_artifact_path(
             cleaned_json_path or chunks_json_path
         )
-    collection_name = (
-        resolved_inputs.get("collection_name")
-        or STAGE4_QDRANT_COLLECTION_NAME
-    )
+    collection_name = str(resolved_inputs.get("collection_name") or "").strip() or None
+    if not collection_name and thread_id:
+        collection_name = build_thread_collection_name(thread_id)
+    if not collection_name:
+        collection_name = STAGE4_QDRANT_COLLECTION_NAME
     retrieval_mode = str(
         resolved_inputs.get("retrieval_mode") or STAGE4_RETRIEVAL_MODE
     ).strip().lower() or "hybrid"
@@ -620,7 +622,7 @@ def run_stage4_retrieval(
         output_dir=output_dir,
         output_paths=output_paths,
         document_id=document_id,
-        room_id=room_id,
+        thread_id=thread_id,
         active_document_ids=active_document_ids,
         collection_name=collection_name,
         retrieval_mode=retrieval_mode,
@@ -691,7 +693,7 @@ def run_stage4_retrieval(
             bm25_fetch_k=bm25_fetch_k,
             hybrid_rrf_weights=hybrid_rrf_weights,
             bm25_excluded_role_hints=bm25_excluded_role_hints,
-            room_id=room_id,
+            thread_id=thread_id,
             document_id=document_id,
             active_document_ids=active_document_ids,
             restrict_to_document=restrict_to_document,

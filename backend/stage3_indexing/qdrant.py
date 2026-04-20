@@ -38,6 +38,14 @@ class QdrantRestClient:
         response.raise_for_status()
         return response.json()
 
+    def delete_collection(self, collection_name: str) -> dict[str, Any] | None:
+        """컬렉션이 있으면 삭제하고, 없으면 None을 반환한다."""
+        response = self._client.delete(f"/collections/{collection_name}")
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+
     def _extract_dense_vector_config(
         self,
         collection: dict[str, Any],

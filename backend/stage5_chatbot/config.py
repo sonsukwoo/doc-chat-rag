@@ -26,10 +26,10 @@ def _env_bool(name: str, default: bool) -> bool:
 # tool-calling과 근거 기반 답변 생성을 모두 수행하므로, nano보다 한 단계 높은 mini를 기본값으로 둔다.
 STAGE5_AGENT_MODEL = os.getenv("STAGE5_AGENT_MODEL", "openai:gpt-4.1-mini")
 
-# 체크포인터는 dev에서는 memory, 운영에서는 postgres를 기본 후보로 둔다.
+# 채팅은 요청 간 맥락 유지가 핵심이므로 postgres를 기본 체크포인터로 둔다.
 STAGE5_CHECKPOINTER_BACKEND = os.getenv(
     "STAGE5_CHECKPOINTER_BACKEND",
-    "memory",
+    "postgres",
 ).strip().lower()
 STAGE5_POSTGRES_URI = os.getenv("STAGE5_POSTGRES_URI", "").strip()
 

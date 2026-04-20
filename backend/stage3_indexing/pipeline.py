@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from backend.common import derive_document_id_from_artifact_path
+from backend.thread_identity import build_thread_collection_name
 from backend.stage3_chunking.embeddings import OpenAIEmbeddingClient
 
 from .config import (
@@ -134,7 +135,7 @@ def _build_page_fields(chunk: dict[str, Any]) -> dict[str, int | None]:
 
 def _build_qdrant_payload(
     *,
-    room_id: str | None,
+    thread_id: str | None,
     document_id: str,
     chunk: dict[str, Any],
 ) -> dict[str, Any]:
@@ -154,8 +155,8 @@ def _build_qdrant_payload(
         **_build_page_fields(chunk),
         "has_asset": has_asset,
     }
-    if room_id:
-        payload["room_id"] = room_id
+    if thread_id:
+        payload["thread_id"] = thread_id
     sparse_role_hints = [
         str(item).strip()
         for item in metadata.get("sparse_role_hints") or []
@@ -176,7 +177,7 @@ def _build_qdrant_payload(
 
 def _build_qdrant_points(
     *,
-    room_id: str | None,
+    thread_id: str | None,
     document_id: str,
     chunks: list[dict[str, Any]],
     embeddings: list[list[float]],
@@ -189,7 +190,7 @@ def _build_qdrant_points(
         point_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
-                f"rag-chat:{room_id or 'global'}:{document_id}:{chunk_id}",
+                f"rag-chat:{thread_id or 'global'}:{document_id}:{chunk_id}",
             )
         )
         vectors: dict[str, Any] = {
@@ -210,7 +211,7 @@ def _build_qdrant_points(
                 "id": point_id,
                 "vector": vectors,
                 "payload": _build_qdrant_payload(
-                    room_id=room_id,
+                    thread_id=thread_id,
                     document_id=document_id,
                     chunk=chunk,
                 ),
@@ -219,20 +220,20 @@ def _build_qdrant_points(
     return points
 
 
-def _build_document_filter(*, room_id: str | None, document_id: str) -> dict[str, Any]:
-    """같은 room/document 범위를 가진 기존 point를 삭제할 때 사용할 Qdrant filter."""
+def _build_document_filter(*, thread_id: str | None, document_id: str) -> dict[str, Any]:
+    """같은 thread/document 범위를 가진 기존 point를 삭제할 때 사용할 Qdrant filter."""
     must: list[dict[str, Any]] = [
         {
             "key": "document_id",
             "match": {"value": document_id},
         }
     ]
-    if room_id:
+    if thread_id:
         must.insert(
             0,
             {
-                "key": "room_id",
-                "match": {"value": room_id},
+                "key": "thread_id",
+                "match": {"value": thread_id},
             },
         )
     return {"must": must}
@@ -274,10 +275,12 @@ def run_stage3_indexing(
         output_dir=output_dir,
     )
 
-    collection_name = (
-        inputs.get("collection_name")
-        or STAGE3_QDRANT_COLLECTION_NAME
-    )
+    thread_id = str(inputs.get("thread_id") or "").strip() or None
+    collection_name = str(inputs.get("collection_name") or "").strip() or None
+    if not collection_name and thread_id:
+        collection_name = build_thread_collection_name(thread_id)
+    if not collection_name:
+        collection_name = STAGE3_QDRANT_COLLECTION_NAME
     dense_vector_name = STAGE3_QDRANT_DENSE_VECTOR_NAME
     bm25_vector_name = STAGE3_QDRANT_BM25_VECTOR_NAME
     has_qdrant_target = bool(qdrant_client is not None or STAGE3_QDRANT_URL)
@@ -289,7 +292,6 @@ def run_stage3_indexing(
     chunks = list(chunks_document.get("chunks") or [])
     indexable_chunks = _select_indexable_chunks(chunks)
     explicit_document_id = inputs.get("document_id")
-    room_id = str(inputs.get("room_id") or "").strip() or None
     if explicit_document_id:
         document_id = explicit_document_id
     else:
@@ -303,7 +305,7 @@ def run_stage3_indexing(
             "chunks_json_path": str(chunks_json_path),
             "output_dir": str(output_dir),
             "document_id": document_id,
-            "room_id": room_id,
+            "thread_id": thread_id,
             "collection_name": collection_name,
             "output_paths": output_paths,
             "planned_outputs": output_paths,
@@ -325,7 +327,7 @@ def run_stage3_indexing(
             "chunks_json_path": str(chunks_json_path),
             "output_dir": str(output_dir),
             "document_id": document_id,
-            "room_id": room_id,
+            "thread_id": thread_id,
             "collection_name": collection_name,
             "output_paths": output_paths,
             "planned_outputs": output_paths,
@@ -350,7 +352,7 @@ def run_stage3_indexing(
 
     vector_size = len(embeddings[0])
     points = _build_qdrant_points(
-        room_id=room_id,
+        thread_id=thread_id,
         document_id=document_id,
         chunks=indexable_chunks,
         embeddings=embeddings,
@@ -375,7 +377,7 @@ def run_stage3_indexing(
         qdrant_client.delete_points_by_filter(
             collection_name=collection_name,
             query_filter=_build_document_filter(
-                room_id=room_id,
+                thread_id=thread_id,
                 document_id=document_id,
             ),
             wait=True,
@@ -394,7 +396,7 @@ def run_stage3_indexing(
         "chunks_json_path": str(chunks_json_path),
         "output_dir": str(output_dir),
         "document_id": document_id,
-        "room_id": room_id,
+        "thread_id": thread_id,
         "collection_name": collection_name,
         "output_paths": output_paths,
         "planned_outputs": output_paths,

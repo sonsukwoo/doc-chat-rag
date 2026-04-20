@@ -27,31 +27,18 @@ def build_schema_ddl() -> list[str]:
         f"CREATE SCHEMA IF NOT EXISTS {pipeline};",
         f"CREATE SCHEMA IF NOT EXISTS {checkpoint};",
         f"""
-        CREATE TABLE IF NOT EXISTS {chat}.rooms (
-            room_id TEXT PRIMARY KEY,
-            room_name TEXT NOT NULL,
-            collection_name TEXT NOT NULL UNIQUE,
+        CREATE TABLE IF NOT EXISTS {chat}.threads (
+            thread_id TEXT PRIMARY KEY,
+            thread_name TEXT NOT NULL,
             description TEXT,
             default_retrieval_mode TEXT NOT NULL DEFAULT 'dense',
             metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            archived_at TIMESTAMPTZ
-        );
-        """,
-        f"""
-        CREATE TABLE IF NOT EXISTS {chat}.threads (
-            thread_id TEXT PRIMARY KEY,
-            room_id TEXT NOT NULL REFERENCES {chat}.rooms(room_id) ON DELETE CASCADE,
-            title TEXT,
-            status TEXT NOT NULL DEFAULT 'active',
-            metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            archived_at TIMESTAMPTZ,
             last_user_message_at TIMESTAMPTZ
         );
         """,
-        f"CREATE INDEX IF NOT EXISTS idx_threads_room_id ON {chat}.threads(room_id);",
         f"""
         CREATE TABLE IF NOT EXISTS {doc}.documents (
             document_id TEXT PRIMARY KEY,
@@ -69,26 +56,26 @@ def build_schema_ddl() -> list[str]:
         );
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {doc}.room_documents (
-            room_id TEXT NOT NULL REFERENCES {chat}.rooms(room_id) ON DELETE CASCADE,
+        CREATE TABLE IF NOT EXISTS {doc}.thread_documents (
+            thread_id TEXT NOT NULL REFERENCES {chat}.threads(thread_id) ON DELETE CASCADE,
             document_id TEXT NOT NULL REFERENCES {doc}.documents(document_id) ON DELETE CASCADE,
             slot_key TEXT NOT NULL,
             is_active BOOLEAN NOT NULL DEFAULT TRUE,
             attached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             detached_at TIMESTAMPTZ,
-            PRIMARY KEY (room_id, document_id)
+            PRIMARY KEY (thread_id, document_id)
         );
         """,
         f"""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_room_documents_active_slot
-        ON {doc}.room_documents(room_id, slot_key)
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_documents_active_slot
+        ON {doc}.thread_documents(thread_id, slot_key)
         WHERE is_active = TRUE AND detached_at IS NULL;
         """,
-        f"CREATE INDEX IF NOT EXISTS idx_room_documents_document_id ON {doc}.room_documents(document_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_thread_documents_document_id ON {doc}.thread_documents(document_id);",
         f"""
         CREATE TABLE IF NOT EXISTS {doc}.document_parents (
-            parent_id TEXT PRIMARY KEY,
             document_id TEXT NOT NULL REFERENCES {doc}.documents(document_id) ON DELETE CASCADE,
+            parent_id TEXT NOT NULL,
             section_title TEXT,
             page_start INTEGER,
             page_end INTEGER,
@@ -97,10 +84,31 @@ def build_schema_ddl() -> list[str]:
             body_text TEXT NOT NULL,
             metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (document_id, parent_id)
         );
         """,
         f"CREATE INDEX IF NOT EXISTS idx_document_parents_document_id ON {doc}.document_parents(document_id);",
+        f"""
+        CREATE TABLE IF NOT EXISTS {doc}.document_chunks (
+            document_id TEXT NOT NULL REFERENCES {doc}.documents(document_id) ON DELETE CASCADE,
+            chunk_id TEXT NOT NULL,
+            parent_id TEXT,
+            chunk_index INTEGER NOT NULL,
+            chunk_type TEXT NOT NULL,
+            page_start INTEGER,
+            page_end INTEGER,
+            pages JSONB NOT NULL DEFAULT '[]'::jsonb,
+            heading_path JSONB NOT NULL DEFAULT '[]'::jsonb,
+            text TEXT NOT NULL,
+            metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (document_id, chunk_id)
+        );
+        """,
+        f"CREATE INDEX IF NOT EXISTS idx_document_chunks_document_id ON {doc}.document_chunks(document_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_document_chunks_parent_order ON {doc}.document_chunks(document_id, parent_id, chunk_index);",
         f"""
         CREATE TABLE IF NOT EXISTS {doc}.document_assets (
             asset_ref TEXT PRIMARY KEY,

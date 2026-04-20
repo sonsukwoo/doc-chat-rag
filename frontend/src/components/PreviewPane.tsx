@@ -135,11 +135,11 @@ export function PreviewPane({
     <div className="preview-pane">
       <div className="preview-pane-header">
         <div>
-          <h2>Document Preview</h2>
+          <h2>문서 캔버스</h2>
           <p>
             {mode === "edit"
-              ? "마우스를 올리면 요소 경계가 보입니다. 클릭 한 번으로 장바구니에 담습니다."
-              : "장바구니 요소를 제거한 결과를 문서 형태로 미리 봅니다."}
+              ? "요소 경계를 보면서 필요한 블록만 바로 선택할 수 있습니다."
+              : "장바구니 요소를 제거한 결과를 문서 흐름 기준으로 미리 봅니다."}
           </p>
         </div>
         <div className="preview-pane-badges">

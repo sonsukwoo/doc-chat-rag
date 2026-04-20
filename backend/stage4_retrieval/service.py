@@ -1,4 +1,4 @@
-"""Stage-4 room-aware retrieval service."""
+"""Stage-4 thread-aware retrieval service."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Any
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnableLambda
 
+from backend.thread_identity import build_thread_collection_name
 from backend.stage3_chunking.embeddings import OpenAIEmbeddingClient
 from backend.stage3_indexing.qdrant import QdrantRestClient
 
@@ -81,10 +82,10 @@ def _normalize_document(document: Document) -> dict[str, Any]:
     }
 
 
-def search_room_knowledge(
+def search_thread_knowledge(
     *,
     query: str,
-    room_id: str | None,
+    thread_id: str | None,
     active_document_ids: list[str] | None = None,
     collection_name: str | None = None,
     retrieval_mode: str | None = None,
@@ -105,9 +106,9 @@ def search_room_knowledge(
     embedding_client: OpenAIEmbeddingClient | None = None,
     qdrant_client: QdrantRestClient | None = None,
 ) -> dict[str, Any]:
-    """room 범위 child chunk 검색만 수행하는 stage5 전용 retrieval entrypoint."""
+    """thread 범위 child chunk 검색만 수행하는 stage5 전용 retrieval entrypoint."""
     normalized_query = str(query or "").strip()
-    normalized_room_id = str(room_id or "").strip() or None
+    normalized_thread_id = str(thread_id or "").strip() or None
     normalized_document_ids = [
         str(item).strip()
         for item in active_document_ids or []
@@ -117,16 +118,17 @@ def search_room_knowledge(
         return {
             "status": "skipped",
             "query": normalized_query,
-            "room_id": normalized_room_id,
+            "thread_id": normalized_thread_id,
             "active_document_ids": normalized_document_ids,
             "retrievals": [],
             "skip_reason": "missing_query",
         }
 
-    resolved_collection_name = (
-        str(collection_name or STAGE4_QDRANT_COLLECTION_NAME).strip()
-        or STAGE4_QDRANT_COLLECTION_NAME
-    )
+    resolved_collection_name = str(collection_name or "").strip()
+    if not resolved_collection_name and normalized_thread_id:
+        resolved_collection_name = build_thread_collection_name(normalized_thread_id)
+    if not resolved_collection_name:
+        resolved_collection_name = STAGE4_QDRANT_COLLECTION_NAME
     resolved_retrieval_mode = (
         str(retrieval_mode or STAGE4_RETRIEVAL_MODE).strip().lower() or "dense"
     )
@@ -176,7 +178,7 @@ def search_room_knowledge(
         return {
             "status": "skipped",
             "query": normalized_query,
-            "room_id": normalized_room_id,
+            "thread_id": normalized_thread_id,
             "active_document_ids": normalized_document_ids,
             "retrievals": [],
             "skip_reason": "missing_qdrant_config",
@@ -208,7 +210,7 @@ def search_room_knowledge(
             },
             rrf_weights=resolved_hybrid_rrf_weights,
             bm25_excluded_role_hints=resolved_bm25_excluded_role_hints,
-            room_id=normalized_room_id,
+            thread_id=normalized_thread_id,
             document_id=resolved_document_id,
             active_document_ids=normalized_document_ids,
             restrict_to_document=resolved_restrict_to_document,
@@ -240,7 +242,7 @@ def search_room_knowledge(
                 },
                 rrf_weights=resolved_hybrid_rrf_weights,
                 bm25_excluded_role_hints=resolved_bm25_excluded_role_hints,
-                room_id=normalized_room_id,
+                thread_id=normalized_thread_id,
                 document_id=resolved_document_id,
                 active_document_ids=normalized_document_ids,
                 restrict_to_document=resolved_restrict_to_document,
@@ -293,7 +295,7 @@ def search_room_knowledge(
     return {
         "status": "completed",
         "query": normalized_query,
-        "room_id": normalized_room_id,
+        "thread_id": normalized_thread_id,
         "active_document_ids": normalized_document_ids,
         "collection_name": resolved_collection_name,
         "retrieval_mode": resolved_retrieval_mode,

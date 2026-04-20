@@ -182,8 +182,8 @@ v1 후보 툴:
 
 - 1, 2 완료
 - 3 완료
-- 4 부분 완료
-  - `document_parents`, `document_assets` 저장 repository/service는 추가됨
+- 4 완료
+  - `document_parents`, `document_assets`, `document_chunks` 저장 repository/service가 추가됨
   - `run_stage3_for_document(..., room_id=...)` 경로에서 stage3 결과를 Postgres와 동기화할 수 있음
 - 5 완료
 - 6 완료
@@ -195,7 +195,10 @@ v1 후보 툴:
 - 9 완료
 - 10 부분 완료
   - retrieval hit 기반 citation과 grounded final answer를 생성함
-  - 다만 visual asset lookup / richer citation formatting은 다음 단계
+  - `expand_context_window`는 Postgres `document_chunks` 기반 실제 window 문맥을 조회함
+  - `load_visual_asset`는 Postgres `document_assets` 기반 실제 asset 메타를 조회함
+  - visual asset을 최종 stage5 output에 첨부할 수 있음
+  - 다만 richer citation formatting과 웹 검색 연결은 다음 단계
 
 ## 11. 문서 운영 규칙
 
@@ -208,7 +211,41 @@ v1 후보 툴:
 
 세부 구현 로그나 실험 결과는 이 파일이 아니라 별도 문서에 남긴다.
 
-## 12. 현재 stage5 그래프
+## 12. 제품 플로우 고정안
+
+현재 프로젝트의 최종 제품 플로우는 "문서 파이프라인"이 아니라 "채팅방 중심 문서 워크스페이스"로 고정한다.
+
+사용자 플로우:
+
+1. 사용자가 `새 채팅방 만들기`를 누른다.
+2. 첫 진입에서는 문서 업로드가 필수다.
+3. 문서를 올리면 자동으로 `stage1 -> stage2`까지 진행한다.
+4. stage2가 끝나면 검수 화면으로 이동한다.
+5. 사용자는 preview 기반으로 element drop / restore를 검토한다.
+6. 사용자가 확정하면 `review overlay -> stage3 chunking/indexing`을 수행한다.
+7. 인덱싱이 끝나면 채팅방이 `ready` 상태가 되고 바로 채팅할 수 있다.
+8. 채팅 중에는 문서 패널에서 현재 방 문서를 확인하고, 문서를 추가/제거/재검수/재색인할 수 있다.
+
+중요 구현 원칙:
+
+- 사용자 경험상 "문서를 넣어야 방이 생성되는 것처럼" 보이게 한다.
+- 내부 구현은 `draft room -> ready room` 전환 구조로 둔다.
+- 검수는 원본 파일을 직접 수정하는 방식이 아니라 `review_decisions.json` overlay를 누적하는 방식으로 둔다.
+- 문서 수정이 생기면 해당 문서만 다시 chunking/indexing 한다.
+- 채팅 검색 범위는 항상 현재 `room_id`와 연결된 `active_document_ids`로 제한한다.
+
+문서 패널에서 지원해야 할 기능:
+
+- 현재 방에 연결된 문서 목록 보기
+- 문서 추가
+- 문서 제거
+- 기존 문서 재검수
+- 기존 drop restore
+- review 수정 후 재색인
+
+이 플로우는 향후 프론트/백엔드/저장소 설계의 기준으로 사용한다.
+
+## 13. 현재 stage5 그래프
 
 현재 `backend/stage5_chatbot` 패키지는 아래 경계를 기준으로 실제 동작 가능한 graph까지 연결돼 있다.
 
@@ -247,15 +284,47 @@ v1 후보 툴:
 - stage4 room-scoped retrieval 서비스 연결
 - 실제 tool-calling agent loop
 - retrieval hit 기반 grounded final answer 생성
+- Postgres `document_chunks` 기반 context window 확장
+- Postgres `document_assets` 기반 visual asset 조회
 
 아직 남은 것은 아래다.
 
 - grounding 결과를 반영한 deeper retrieval 정책 연결
 - grounding 결과를 반영한 deeper retrieval / clarify 정책 고도화
 - citation 포함 최종 답변 렌더링 고도화
-- `expand_context_window`, `load_visual_asset`, `web_search` 실제 연결
+- `web_search` 실제 연결
 
-## 13. Postgres 스키마 기준
+## 14. Room 중심 서비스 구현 순서
+
+다음 구현은 CLI 파이프라인을 늘리는 방식이 아니라, room-aware 서비스 플로우를 먼저 완성하는 순서로 진행한다.
+
+1. room CRUD API
+2. room에 첫 문서를 업로드하면서 `draft room`을 생성하는 API
+3. room 기준 `stage1 -> stage2 -> review -> stage3` 실행 연결
+4. room 기준 stage5 chat API
+5. clarification interrupt / resume API
+6. 문서 패널용 문서 추가 / 제거 / 재검수 / 재색인 API
+7. 프론트에서 GPT 스타일 채팅 UI와 문서 패널 연결
+
+통합 테스트는 위 흐름이 붙은 뒤에만 진행한다.
+그 전에는 Qdrant/Postgres/outputs를 초기화하고 재적재하는 비용이 큰데, 아직 진입점이 완전히 통일되지 않아 의미가 떨어진다.
+
+## 15. 통합 테스트 원칙
+
+프론트 연결 후 end-to-end 테스트를 시작할 때는 아래 기준으로 초기화 후 다시 적재한다.
+
+- `backend/outputs` 테스트 산출물 정리
+- Qdrant 테스트 컬렉션 정리 또는 새 컬렉션 사용
+- Postgres의 room/thread/document 메타 정리
+
+이유:
+
+- 기존 CLI 실험 산출물과 room-aware 서비스 경로가 혼재되면 추적이 어려워진다.
+- 통합 테스트 시점에는 "새 방 생성 -> 첫 문서 업로드 -> 검수 -> 인덱싱 -> 채팅" 전체를 처음부터 재현 가능해야 한다.
+
+운영 단계에서는 이 초기화 전략을 쓰지 않고, room/document lifecycle API로 증분 관리한다.
+
+## 16. Postgres 스키마 기준
 
 현재 Postgres는 DB 1개 + schema 분리 방식으로 고정한다.
 

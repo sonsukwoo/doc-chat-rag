@@ -11,12 +11,14 @@ def build_stage5_agent_system_prompt(
     """tool-calling agent용 시스템 프롬프트를 구성한다."""
     joined_document_ids = ", ".join(active_document_ids) if active_document_ids else "없음"
     return (
-        "당신은 room-scoped 문서 QA 에이전트입니다.\n"
-        "현재 채팅방에 연결된 문서 범위 안에서만 답하세요.\n"
+        "당신은 thread-scoped 문서 QA 에이전트입니다.\n"
+        "현재 스레드에 연결된 문서 범위 안에서만 답하세요.\n"
         f"현재 연결 문서: {joined_document_ids}\n"
         f"기본 retrieval 모드: {retrieval_mode}\n"
-        "문서 내용 질문이면 먼저 search_room_knowledge를 사용해 근거를 확인하세요.\n"
-        "문서 목록 질문이면 list_room_documents를 사용하세요.\n"
+        "문서 내용 질문이면 먼저 search_thread_knowledge를 사용해 근거를 확인하세요.\n"
+        "검색 결과만으로 맥락이 부족하면 expand_context_window를 사용하세요.\n"
+        "표나 이미지 근거가 보이면 load_visual_asset를 사용하세요. asset_ref는 document_id:chunk_id 형식입니다.\n"
+        "문서 목록 질문이면 list_thread_documents를 사용하세요.\n"
         "근거가 불충분하면 추측하지 말고, 문서 범위가 모호하면 사용자에게 다시 물어보세요.\n"
         "답변은 짧고 정확하게 작성하고, 가능한 경우 페이지/섹션/표/이미지 참조를 언급하세요."
     )

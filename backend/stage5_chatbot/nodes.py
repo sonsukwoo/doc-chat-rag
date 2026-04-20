@@ -8,7 +8,8 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
 
-from backend.stage4_retrieval import search_room_knowledge as default_search_room_knowledge
+from backend.thread_identity import build_thread_collection_name
+from backend.stage4_retrieval import search_thread_knowledge as default_search_thread_knowledge
 
 from .config import STAGE5_DEFAULT_RETRIEVAL_MODE, STAGE5_DEFAULT_TOP_K
 from .models import FinalAnswerResult, GroundingCheckResult
@@ -38,13 +39,29 @@ def _get_latest_ai_message(state: ChatbotState) -> AIMessage | None:
     return None
 
 
+def _get_current_turn_messages(state: ChatbotState) -> list[Any]:
+    messages = list(state.get("messages") or [])
+    last_human_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], HumanMessage):
+            last_human_index = index
+            break
+    if last_human_index < 0:
+        return messages
+    return messages[last_human_index:]
+
+
 def _iter_tool_messages(
     state: ChatbotState,
     *,
     tool_name: str | None = None,
+    current_turn_only: bool = False,
 ) -> list[ToolMessage]:
     tool_messages: list[ToolMessage] = []
-    for message in state.get("messages") or []:
+    source_messages = (
+        _get_current_turn_messages(state) if current_turn_only else list(state.get("messages") or [])
+    )
+    for message in source_messages:
         if not isinstance(message, ToolMessage):
             continue
         if tool_name and getattr(message, "name", None) != tool_name:
@@ -67,7 +84,11 @@ def _parse_tool_message_json(message: ToolMessage) -> dict[str, Any] | None:
 
 
 def _extract_latest_search_payload(state: ChatbotState) -> dict[str, Any] | None:
-    search_messages = _iter_tool_messages(state, tool_name="search_room_knowledge")
+    search_messages = _iter_tool_messages(
+        state,
+        tool_name="search_thread_knowledge",
+        current_turn_only=True,
+    )
     for message in reversed(search_messages):
         payload = _parse_tool_message_json(message)
         if payload is not None:
@@ -78,15 +99,19 @@ def _extract_latest_search_payload(state: ChatbotState) -> dict[str, Any] | None
 def _build_context_blocks(retrieval_hits: list[dict[str, Any]]) -> list[str]:
     context_blocks: list[str] = []
     for index, hit in enumerate(retrieval_hits, start=1):
+        document_id = str(hit.get("document_id") or "")
+        chunk_id = str(hit.get("chunk_id") or "")
         lines = [
             f"[근거 {index}]",
-            f"document_id: {str(hit.get('document_id') or '')}",
-            f"chunk_id: {str(hit.get('chunk_id') or '')}",
+            f"document_id: {document_id}",
+            f"chunk_id: {chunk_id}",
         ]
         if hit.get("section_title"):
             lines.append(f"section_title: {str(hit['section_title'])}")
         if hit.get("primary_page") is not None:
             lines.append(f"page: {int(hit['primary_page'])}")
+        if hit.get("asset_relative_path"):
+            lines.append(f"asset_ref: {document_id}:{chunk_id}")
         if hit.get("caption"):
             lines.append(f"caption: {str(hit['caption'])}")
         lines.append(f"text: {str(hit.get('text') or '').strip()}")
@@ -96,24 +121,76 @@ def _build_context_blocks(retrieval_hits: list[dict[str, Any]]) -> list[str]:
 
 def _build_citations(retrieval_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     citations = []
+    seen_keys: set[tuple[str, str, int | None, str | None, str | None]] = set()
     for hit in retrieval_hits:
-        citations.append(
+        document_id = str(hit.get("document_id") or "")
+        chunk_id = str(hit.get("chunk_id") or "")
+        citation = {
+            "document_id": document_id,
+            "chunk_id": chunk_id,
+            "parent_id": hit.get("parent_id"),
+            "page": hit.get("primary_page"),
+            "section_title": hit.get("section_title"),
+            "asset_ref": (
+                f"{document_id}:{chunk_id}"
+                if hit.get("asset_relative_path")
+                else None
+            ),
+            "asset_relative_path": hit.get("asset_relative_path"),
+        }
+        dedupe_key = (
+            document_id,
+            chunk_id,
+            citation.get("page"),
+            str(citation.get("section_title") or "") or None,
+            str(citation.get("asset_ref") or "") or None,
+        )
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        citations.append(citation)
+    return citations
+
+
+def _truncate_text(value: str, limit: int = 240) -> str:
+    normalized = " ".join(str(value or "").split()).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[: limit - 1].rstrip()}…"
+
+
+def _build_evidence_chunks(
+    retrieval_hits: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    evidence_chunks: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for hit in retrieval_hits:
+        document_id = str(hit.get("document_id") or "").strip()
+        chunk_id = str(hit.get("chunk_id") or "").strip()
+        if not document_id or not chunk_id:
+            continue
+        dedupe_key = (document_id, chunk_id)
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        evidence_chunks.append(
             {
-                "document_id": str(hit.get("document_id") or ""),
-                "chunk_id": str(hit.get("chunk_id") or ""),
+                "document_id": document_id,
+                "chunk_id": chunk_id,
                 "parent_id": hit.get("parent_id"),
                 "page": hit.get("primary_page"),
                 "section_title": hit.get("section_title"),
-                "asset_relative_path": hit.get("asset_relative_path"),
+                "chunk_type": hit.get("chunk_type"),
+                "text_excerpt": _truncate_text(str(hit.get("text") or "")),
             }
         )
-    return citations
+    return evidence_chunks
 
 
 def _should_force_clarification(state: ChatbotState, query_text: str) -> tuple[bool, str]:
     active_document_ids = [str(item) for item in state.get("active_document_ids") or [] if str(item)]
     if not active_document_ids:
-        return True, "현재 채팅방에 연결된 문서가 없습니다."
+        return True, "현재 스레드에 연결된 문서가 없습니다."
 
     if len(active_document_ids) > 1 and query_text:
         vague_markers = ("이 문서", "이거", "여기", "저 문서", "이 논문")
@@ -123,10 +200,43 @@ def _should_force_clarification(state: ChatbotState, query_text: str) -> tuple[b
     return False, ""
 
 
+def _is_smalltalk_query(query_text: str) -> bool:
+    normalized = " ".join(str(query_text or "").strip().lower().split())
+    if not normalized:
+        return False
+
+    exact_matches = {
+        "안녕",
+        "안녕하세요",
+        "반가워",
+        "반갑습니다",
+        "고마워",
+        "감사합니다",
+        "hi",
+        "hello",
+        "thanks",
+        "thank you",
+    }
+    if normalized in exact_matches:
+        return True
+
+    smalltalk_prefixes = (
+        "안녕",
+        "안녕하세요",
+        "hi ",
+        "hello ",
+        "thanks ",
+        "thank you ",
+    )
+    return any(normalized.startswith(prefix) for prefix in smalltalk_prefixes)
+
+
 def _build_query_analysis(state: ChatbotState, query_text: str) -> QueryAnalysisPayload:
     needs_clarification, reason = _should_force_clarification(state, query_text)
     query_kind: QueryAnalysisPayload["query_kind"] = "general"
     lowered = query_text.lower()
+    if _is_smalltalk_query(query_text):
+        query_kind = "smalltalk"
     if any(token in lowered for token in ("table", "figure", "section", "appendix", "page")):
         query_kind = "lexical"
     if needs_clarification:
@@ -151,13 +261,36 @@ def _build_retrieval_policy(query_analysis: QueryAnalysisPayload) -> RetrievalPo
 
 def load_request_context(state: ChatbotState) -> dict[str, Any]:
     """외부 입력을 챗봇 state 기본 구조에 맞게 정리한다."""
+    normalized_user_message = str(state.get("user_message") or "").strip()
     updates: dict[str, Any] = {
         "logs": ["load_request_context"],
+        # 턴별 검색/판정 산출물은 새 질문 시작 시 비워서
+        # 이전 retrieval 근거가 다음 질문에 섞이지 않게 한다.
+        "retrieval_hits": [],
+        "expanded_context_blocks": [],
+        "citations": [],
+        "evidence_chunks": [],
+        "answer_draft": None,
+        "final_answer": None,
+        "grounding_decision": {
+            "enough_evidence": False,
+            "needs_deeper_retrieval": False,
+            "needs_clarification": False,
+            "clarification_question": None,
+            "missing_aspects": [],
+        },
+        "clarification_payload": None,
+        "clarification_response": None,
+        "needs_clarification": False,
     }
-    if not state.get("messages") and state.get("user_message"):
-        updates["messages"] = [HumanMessage(content=str(state["user_message"]).strip())]
-    if not state.get("thread_id") and state.get("room_id"):
-        updates["thread_id"] = str(state["room_id"])
+    current_messages = list(state.get("messages") or [])
+    last_message = current_messages[-1] if current_messages else None
+    if normalized_user_message and not (
+        isinstance(last_message, HumanMessage)
+        and isinstance(last_message.content, str)
+        and last_message.content.strip() == normalized_user_message
+    ):
+        updates["messages"] = [HumanMessage(content=normalized_user_message)]
     return updates
 
 
@@ -263,19 +396,24 @@ def build_grounding_check_node(
 
     def grounding_check(state: ChatbotState) -> dict[str, Any]:
         latest_search_payload = _extract_latest_search_payload(state)
+        query_analysis = dict(state.get("query_analysis") or {})
+        query_kind = str(query_analysis.get("query_kind") or "general").strip()
         retrieval_hits = list(
             (latest_search_payload or {}).get("retrievals")
             or state.get("retrieval_hits")
             or []
         )
         expanded_context_blocks = _build_context_blocks(retrieval_hits)
-        has_any_tool_result = bool(_iter_tool_messages(state))
+        has_any_tool_result = bool(_iter_tool_messages(state, current_turn_only=True))
         answer_draft = str(state.get("answer_draft") or "").strip()
 
         if not retrieval_hits:
             enough_evidence = False
             reason = "grounded retrieval evidence is missing"
-            if has_any_tool_result and answer_draft:
+            if query_kind == "smalltalk" and answer_draft:
+                enough_evidence = True
+                reason = "smalltalk answer does not require document retrieval"
+            elif has_any_tool_result and answer_draft:
                 enough_evidence = True
                 reason = "non-search tool result answered the request"
 
@@ -296,7 +434,6 @@ def build_grounding_check_node(
                 ],
             }
 
-        query_analysis = dict(state.get("query_analysis") or {})
         query_text = str(
             query_analysis.get("query_text") or _get_latest_user_text(state)
         ).strip()
@@ -351,10 +488,10 @@ def build_grounding_check_node(
 
 def build_fallback_or_retrieve_deeper_node(
     *,
-    retrieval_runner: Any = default_search_room_knowledge,
+    retrieval_runner: Any = default_search_thread_knowledge,
 ):
     """deeper retrieval을 deterministic하게 수행하는 노드를 생성한다."""
-    resolved_retrieval_runner = retrieval_runner or default_search_room_knowledge
+    resolved_retrieval_runner = retrieval_runner or default_search_thread_knowledge
 
     def fallback_or_retrieve_deeper(state: ChatbotState) -> dict[str, Any]:
         query_analysis = dict(state.get("query_analysis") or {})
@@ -363,16 +500,20 @@ def build_fallback_or_retrieve_deeper_node(
         query_kind = str(query_analysis.get("query_kind") or "general").strip()
         base_mode = str(retrieval_policy.get("mode") or STAGE5_DEFAULT_RETRIEVAL_MODE).strip() or STAGE5_DEFAULT_RETRIEVAL_MODE
         deep_mode = "hybrid" if query_kind == "lexical" else base_mode
+        thread_id = str(state.get("thread_id") or "").strip() or None
+        collection_name = str(state.get("collection_name") or "").strip() or None
+        if collection_name is None and thread_id:
+            collection_name = build_thread_collection_name(thread_id)
 
         result = resolved_retrieval_runner(
             query=query_text,
-            room_id=str(state.get("room_id") or "").strip() or None,
+            thread_id=thread_id,
             active_document_ids=[
                 str(item)
                 for item in state.get("active_document_ids") or []
                 if str(item)
             ],
-            collection_name=str(state.get("collection_name") or "").strip() or None,
+            collection_name=collection_name,
             retrieval_mode=deep_mode,
             top_k=int(retrieval_policy.get("top_k") or STAGE5_DEFAULT_TOP_K),
             enable_rerank=bool(retrieval_policy.get("use_rerank", True)),
@@ -408,6 +549,7 @@ def build_compose_answer_with_citations_node(
     def compose_answer_with_citations(state: ChatbotState) -> dict[str, Any]:
         retrieval_hits = list(state.get("retrieval_hits") or [])
         citations = _build_citations(retrieval_hits)
+        evidence_chunks = _build_evidence_chunks(retrieval_hits)
         answer_draft = str(state.get("answer_draft") or "").strip()
 
         if answer_draft and retrieval_hits:
@@ -440,6 +582,7 @@ def build_compose_answer_with_citations_node(
         updates: dict[str, Any] = {
             "final_answer": final_answer,
             "citations": citations,
+            "evidence_chunks": evidence_chunks,
             "logs": ["compose_answer_with_citations"],
         }
         latest_ai_message = _get_latest_ai_message(state)
@@ -484,6 +627,6 @@ def route_after_grounding(state: ChatbotState) -> str:
     decision = state.get("grounding_decision") or {}
     if bool(decision.get("needs_clarification")) or bool(state.get("needs_clarification")):
         return "clarify_if_needed"
-    if not bool(decision.get("enough_evidence")):
+    if bool(decision.get("needs_deeper_retrieval")):
         return "fallback_or_retrieve_deeper"
     return "compose_answer_with_citations"

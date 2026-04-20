@@ -91,13 +91,14 @@ def run_stage2_for_document(document_id: str) -> dict[str, Any]:
 def run_stage3_for_document(
     document_id: str,
     *,
-    room_id: str | None = None,
+    thread_id: str | None = None,
     collection_name: str | None = None,
 ) -> dict[str, Any]:
     """review overlay가 있으면 이를 우선 사용해 chunking/indexing을 수행한다."""
     paths = build_document_paths(document_id)
     document_record = load_document_record(document_id)
     cleaned_json_path = get_effective_cleaned_json_path(paths)
+    outputs: dict[str, str] = {}
     update_document_stage_record(
         document_id=document_id,
         stage="stage3",
@@ -109,7 +110,7 @@ def run_stage3_for_document(
                 "cleaned_json_path": str(cleaned_json_path),
                 "output_dir": str(paths.stage3_dir),
                 "document_id": document_id,
-                "room_id": room_id,
+                "thread_id": thread_id,
                 "collection_name": collection_name,
             }
         )
@@ -125,17 +126,11 @@ def run_stage3_for_document(
                 for key, value in (indexing_output.get("output_paths") or {}).items()
             },
         }
-        update_document_stage_record(
-            document_id=document_id,
-            stage="stage3",
-            status="completed",
-            outputs=outputs,
-        )
-        if room_id:
+        if thread_id:
             parents_payload = json.loads(paths.stage3_parents_json.read_text())
             chunks_payload = json.loads(paths.stage3_chunks_json.read_text())
             sync_document_runtime_metadata(
-                room_id=room_id,
+                thread_id=thread_id,
                 document_id=document_id,
                 original_filename=str(document_record.get("original_filename") or f"{document_id}.pdf"),
                 normalized_filename=f"{document_id}.pdf",
@@ -144,6 +139,12 @@ def run_stage3_for_document(
                 parents=list(parents_payload.get("parents") or []),
                 chunks=list(chunks_payload.get("chunks") or []),
             )
+        update_document_stage_record(
+            document_id=document_id,
+            stage="stage3",
+            status="completed",
+            outputs=outputs,
+        )
         return result
     except Exception as exc:
         update_document_stage_record(
@@ -151,5 +152,6 @@ def run_stage3_for_document(
             stage="stage3",
             status="failed",
             error=str(exc),
+            outputs=outputs or None,
         )
         raise

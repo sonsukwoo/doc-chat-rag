@@ -7,19 +7,19 @@ from backend.stage3_indexing.qdrant import QdrantRestClient
 
 def build_scope_filter(
     *,
-    room_id: str | None = None,
+    thread_id: str | None = None,
     document_id: str | None = None,
     active_document_ids: list[str] | None = None,
     restrict_to_document: bool = True,
 ) -> dict[str, object] | None:
-    """room/document 범위를 함께 제한하는 Qdrant filter를 만든다."""
+    """thread/document 범위를 함께 제한하는 Qdrant filter를 만든다."""
     must: list[dict[str, object]] = []
 
-    if room_id:
+    if thread_id:
         must.append(
             {
-                "key": "room_id",
-                "match": {"value": room_id},
+                "key": "thread_id",
+                "match": {"value": thread_id},
             }
         )
 
@@ -52,7 +52,7 @@ def build_scope_filter(
 def build_bm25_filter(
     *,
     bm25_vector_name: str,
-    room_id: str | None = None,
+    thread_id: str | None = None,
     document_id: str | None = None,
     active_document_ids: list[str] | None = None,
     restrict_to_document: bool = True,
@@ -60,7 +60,7 @@ def build_bm25_filter(
 ) -> dict[str, object] | None:
     """BM25 브랜치 전용 필터를 만든다."""
     base_filter = build_scope_filter(
-        room_id=room_id,
+        thread_id=thread_id,
         document_id=document_id,
         active_document_ids=active_document_ids,
         restrict_to_document=restrict_to_document,
@@ -101,7 +101,7 @@ def search_dense_chunks(
     query_vector: list[float],
     top_k: int,
     dense_vector_name: str = "dense",
-    room_id: str | None = None,
+    thread_id: str | None = None,
     document_id: str | None = None,
     active_document_ids: list[str] | None = None,
     restrict_to_document: bool = True,
@@ -109,7 +109,7 @@ def search_dense_chunks(
 ) -> list[dict[str, object]]:
     """dense query vector로 chunk top-k를 조회한다."""
     query_filter = build_scope_filter(
-        room_id=room_id,
+        thread_id=thread_id,
         document_id=document_id,
         active_document_ids=active_document_ids,
         restrict_to_document=restrict_to_document,
@@ -141,7 +141,7 @@ def search_hybrid_chunks(
     bm25_options: dict[str, object],
     rrf_weights: list[float] | None = None,
     bm25_excluded_role_hints: list[str] | None = None,
-    room_id: str | None = None,
+    thread_id: str | None = None,
     document_id: str | None = None,
     active_document_ids: list[str] | None = None,
     restrict_to_document: bool = True,
@@ -149,7 +149,7 @@ def search_hybrid_chunks(
 ) -> list[dict[str, object]]:
     """dense prefetch + bm25 prefetch + RRF fusion으로 chunk top-k를 조회한다."""
     query_filter = build_scope_filter(
-        room_id=room_id,
+        thread_id=thread_id,
         document_id=document_id,
         active_document_ids=active_document_ids,
         restrict_to_document=restrict_to_document,
@@ -176,7 +176,7 @@ def search_hybrid_chunks(
     }
     bm25_filter = build_bm25_filter(
         bm25_vector_name=bm25_vector_name,
-        room_id=room_id,
+        thread_id=thread_id,
         document_id=document_id,
         active_document_ids=active_document_ids,
         restrict_to_document=restrict_to_document,

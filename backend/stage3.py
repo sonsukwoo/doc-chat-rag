@@ -26,7 +26,7 @@ def run_stage3(inputs: dict[str, Any] | None = None) -> dict[str, Any]:
             "chunks_json_path": chunking_output["output_paths"]["chunks_json"],
             "output_dir": chunking_output["output_dir"],
             "document_id": resolved_inputs.get("document_id"),
-            "room_id": resolved_inputs.get("room_id"),
+            "thread_id": resolved_inputs.get("thread_id"),
             "collection_name": resolved_inputs.get("collection_name"),
         }
     )

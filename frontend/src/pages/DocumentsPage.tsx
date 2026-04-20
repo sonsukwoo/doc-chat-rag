@@ -1,198 +1,214 @@
 import { useEffect, useMemo, useState } from "react";
-import type { DragEvent } from "react";
-import { Link } from "react-router-dom";
+import type { DragEvent, FormEvent } from "react";
+import { useNavigate } from "react-router-dom";
 
-import { getDocument, listDocuments, runStage, uploadDocument } from "../lib/api";
-import { StageBadge } from "../components/StageBadge";
-import type { DocumentRecord } from "../types";
-
-type BusyMap = Record<string, string | null>;
+import { ThreadSidebar } from "../components/ThreadSidebar";
+import { bootstrapThread, deleteThread, listThreads } from "../lib/api";
+import type { ThreadRecord } from "../types";
 
 export function DocumentsPage() {
-  const [documents, setDocuments] = useState<DocumentRecord[]>([]);
-  const [uploading, setUploading] = useState(false);
-  const [busyMap, setBusyMap] = useState<BusyMap>({});
+  const navigate = useNavigate();
+
+  const [threads, setThreads] = useState<ThreadRecord[]>([]);
+  const [threadName, setThreadName] = useState("");
+  const [defaultRetrievalMode, setDefaultRetrievalMode] = useState<"dense" | "hybrid">(
+    "dense",
+  );
+  const [bootstrapFile, setBootstrapFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [deletingThreadId, setDeletingThreadId] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  async function refreshDocuments() {
-    const response = await listDocuments();
-    setDocuments(response.documents);
+  const sortedThreads = useMemo(
+    () =>
+      [...threads].sort((a, b) =>
+        String(b.updated_at || "").localeCompare(String(a.updated_at || "")),
+      ),
+    [threads],
+  );
+
+  async function refreshThreads() {
+    const response = await listThreads();
+    setThreads(response.threads);
   }
 
   useEffect(() => {
-    void refreshDocuments();
+    void refreshThreads().catch((error) => {
+      setErrorMessage(
+        error instanceof Error ? error.message : "thread 목록을 불러오지 못했습니다.",
+      );
+    });
   }, []);
 
-  async function handleFileUpload(file: File) {
-    setErrorMessage(null);
-    setUploading(true);
-    try {
-      const response = await uploadDocument(file);
-      setDocuments((previous) => [response.document, ...previous]);
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "업로드에 실패했습니다.");
-    } finally {
-      setUploading(false);
-    }
-  }
+  async function handleBootstrapSubmit(event?: FormEvent<HTMLFormElement>) {
+    event?.preventDefault();
 
-  async function handleStageRun(documentId: string, stage: "stage1" | "stage2" | "stage3") {
+    if (!bootstrapFile) {
+      setErrorMessage("첫 PDF 문서를 선택해야 합니다.");
+      return;
+    }
+    if (!threadName.trim()) {
+      setErrorMessage("채팅방 이름을 입력해야 합니다.");
+      return;
+    }
+
+    setBusy(true);
     setErrorMessage(null);
-    setBusyMap((previous) => ({ ...previous, [documentId]: stage }));
     try {
-      await runStage(documentId, stage);
-      const updated = await getDocument(documentId);
-      setDocuments((previous) =>
-        previous.map((item) =>
-          item.document_id === documentId ? updated.document : item,
-        ),
+      const result = await bootstrapThread({
+        threadName: threadName.trim(),
+        defaultRetrievalMode,
+        file: bootstrapFile,
+      });
+      setThreadName("");
+      setBootstrapFile(null);
+      await refreshThreads();
+      navigate(
+        `/threads/${encodeURIComponent(result.thread.thread_id)}/documents/${encodeURIComponent(
+          result.document.document_id,
+        )}/review`,
       );
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : `${stage} 실행에 실패했습니다.`);
+      setErrorMessage(
+        error instanceof Error ? error.message : "채팅방 생성과 문서 준비에 실패했습니다.",
+      );
     } finally {
-      setBusyMap((previous) => ({ ...previous, [documentId]: null }));
+      setBusy(false);
     }
   }
 
-  function onDrop(event: DragEvent<HTMLLabelElement>) {
+  function onBootstrapDrop(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault();
     const file = event.dataTransfer.files?.[0];
     if (file) {
-      void handleFileUpload(file);
+      setBootstrapFile(file);
     }
   }
 
-  const sortedDocuments = useMemo(
-    () =>
-      [...documents].sort((a, b) =>
-        (b.uploaded_at || "").localeCompare(a.uploaded_at || ""),
-      ),
-    [documents],
-  );
+  async function handleDeleteThread(threadId: string) {
+    if (!threadId || deletingThreadId) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      "이 채팅방을 삭제하면 연결 문서 메타데이터, 체크포인터, Qdrant 인덱스와 로컬 산출물이 함께 제거됩니다. 계속하시겠습니까?",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingThreadId(threadId);
+    setErrorMessage(null);
+    try {
+      const response = await deleteThread(threadId);
+      if (response.cleanup_warnings.length > 0) {
+        window.alert(
+          `채팅방 삭제는 완료됐지만 일부 외부 정리를 확인해야 합니다.\n\n${response.cleanup_warnings.join("\n")}`,
+        );
+      }
+      setThreads((current) => current.filter((thread) => thread.thread_id !== threadId));
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "채팅방 삭제에 실패했습니다.",
+      );
+    } finally {
+      setDeletingThreadId(null);
+    }
+  }
 
   return (
-    <div className="app-page">
-      <section className="hero-card">
-        <div className="hero-copy">
-          <p className="eyebrow">Local Review Workspace</p>
-          <h1>문서 업로드 후 stage별로 처리하고, stage2 결과를 바로 검수합니다.</h1>
-          <p className="hero-description">
-            현재 버전은 업로드, stage1/stage2/stage3 실행, review 진입까지를 로컬 웹앱으로 묶습니다.
-          </p>
-        </div>
-        <label
-          className={`upload-dropzone ${uploading ? "is-busy" : ""}`}
-          onDragOver={(event) => event.preventDefault()}
-          onDrop={onDrop}
-        >
-          <input
-            type="file"
-            accept="application/pdf"
-            onChange={(event) => {
-              const file = event.target.files?.[0];
-              if (file) {
-                void handleFileUpload(file);
-              }
-            }}
-          />
-          <div className="upload-dropzone-content">
-            <strong>{uploading ? "업로드 중..." : "PDF를 드래그해서 올리거나 선택하세요"}</strong>
-            <span>원본 파일명은 보존하고, 내부 저장은 document_id 기준으로 진행합니다.</span>
+    <div className="workspace-shell workspace-shell--chat app-shell">
+      <ThreadSidebar
+        threads={sortedThreads}
+        selectedThreadId={null}
+        onSelectThread={(threadId) => navigate(`/threads/${encodeURIComponent(threadId)}/chat`)}
+        onCreateThread={() => {
+          setErrorMessage(null);
+          setThreadName("");
+          setBootstrapFile(null);
+        }}
+        onRefresh={() => void refreshThreads()}
+        onDeleteThread={(threadId) => void handleDeleteThread(threadId)}
+        deletingThreadId={deletingThreadId}
+      />
+
+      <main className="workspace-main workspace-main--chat thread-home-main">
+        {errorMessage ? <div className="error-banner">{errorMessage}</div> : null}
+
+        <section className="thread-launcher">
+          <div className="thread-launcher-copy">
+            <p className="eyebrow">Start</p>
+            <h2>
+              {sortedThreads.length === 0
+                ? "첫 채팅방을 만들고 문서 검수부터 시작하세요"
+                : "새 채팅방을 만들고 PDF를 바로 올리세요"}
+            </h2>
+            <p className="muted-text">
+              문서를 올리면 stage1, stage2 후 바로 검수 화면으로 이동하고, 끝나면 채팅방별로
+              대화를 이어갈 수 있습니다.
+            </p>
           </div>
-        </label>
-      </section>
 
-      {errorMessage ? <div className="error-banner">{errorMessage}</div> : null}
+          <form
+            className="thread-launcher-card"
+            onSubmit={(event) => void handleBootstrapSubmit(event)}
+          >
+            <div className="thread-launcher-row">
+              <label className="field-group">
+                <span>채팅방 이름</span>
+                <input
+                  className="input"
+                  value={threadName}
+                  onChange={(event) => setThreadName(event.target.value)}
+                  placeholder="예: 피부질환 논문 QA"
+                />
+              </label>
 
-      <section className="section-card">
-        <div className="section-card-header">
-          <div>
-            <p className="eyebrow">Documents</p>
-            <h2>문서 목록</h2>
-          </div>
-          <button className="ghost-button" onClick={() => void refreshDocuments()}>
-            새로고침
-          </button>
-        </div>
-
-        <div className="documents-grid">
-          {sortedDocuments.length === 0 ? (
-            <div className="empty-state">
-              아직 업로드된 문서가 없습니다. PDF를 올린 뒤 stage를 순차 실행하세요.
+              <label className="field-group">
+                <span>검색 모드</span>
+                <select
+                  className="input"
+                  value={defaultRetrievalMode}
+                  onChange={(event) =>
+                    setDefaultRetrievalMode(event.target.value as "dense" | "hybrid")
+                  }
+                >
+                  <option value="dense">dense</option>
+                  <option value="hybrid">hybrid</option>
+                </select>
+              </label>
             </div>
-          ) : null}
 
-          {sortedDocuments.map((document) => {
-            const busyStage = busyMap[document.document_id];
-            const stages = document.stages || {};
-            const stage1Status = stages.stage1?.status;
-            const stage2Status = stages.stage2?.status;
-            const reviewStatus = stages.review?.status;
-            const stage3Status = stages.stage3?.status;
+            <div className="thread-launcher-steps">
+              <span>1. PDF 업로드</span>
+              <span>2. 검수 진행</span>
+              <span>3. 채팅 시작</span>
+            </div>
 
-            return (
-              <article key={document.document_id} className="document-card">
-                <div className="document-card-header">
-                  <div>
-                    <h3>{document.original_filename}</h3>
-                    <p className="muted-text">{document.document_id}</p>
-                  </div>
-                  <span className="timestamp">{document.uploaded_at}</span>
-                </div>
+            <label
+              className={`upload-dropzone compact thread-launcher-dropzone ${busy ? "is-busy" : ""}`}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={onBootstrapDrop}
+            >
+              <input
+                type="file"
+                accept="application/pdf"
+                onChange={(event) => setBootstrapFile(event.target.files?.[0] || null)}
+              />
+              <div className="upload-dropzone-content">
+                <strong>{bootstrapFile ? bootstrapFile.name : "첫 PDF 문서를 선택하세요"}</strong>
+                <span>업로드 직후 검수 화면으로 이동합니다.</span>
+              </div>
+            </label>
 
-                <div className="document-stage-list">
-                  <StageBadge label="upload" status={stages.upload?.status} />
-                  <StageBadge label="stage1" status={stage1Status} />
-                  <StageBadge label="stage2" status={stage2Status} />
-                  <StageBadge label="review" status={reviewStatus} />
-                  <StageBadge label="stage3" status={stage3Status} />
-                </div>
-
-                <div className="document-actions">
-                  <button
-                    className="primary-button"
-                    disabled={busyStage !== undefined && busyStage !== null}
-                    onClick={() => void handleStageRun(document.document_id, "stage1")}
-                  >
-                    {busyStage === "stage1" ? "Stage1 실행 중..." : "Stage1 실행"}
-                  </button>
-                  <button
-                    className="secondary-button"
-                    disabled={stage1Status !== "completed" || Boolean(busyStage)}
-                    onClick={() => void handleStageRun(document.document_id, "stage2")}
-                  >
-                    {busyStage === "stage2" ? "Stage2 실행 중..." : "Stage2 실행"}
-                  </button>
-                  <Link
-                    className={`secondary-button link-button ${
-                      stage2Status !== "completed" ? "is-disabled" : ""
-                    }`}
-                    to={
-                      stage2Status === "completed"
-                        ? `/documents/${document.document_id}/review`
-                        : "#"
-                    }
-                    onClick={(event) => {
-                      if (stage2Status !== "completed") {
-                        event.preventDefault();
-                      }
-                    }}
-                  >
-                    검수 열기
-                  </Link>
-                  <button
-                    className="secondary-button"
-                    disabled={stage2Status !== "completed" || Boolean(busyStage)}
-                    onClick={() => void handleStageRun(document.document_id, "stage3")}
-                  >
-                    {busyStage === "stage3" ? "Stage3 실행 중..." : "Stage3 실행"}
-                  </button>
-                </div>
-              </article>
-            );
-          })}
-        </div>
-      </section>
+            <div className="detail-actions">
+              <button className="primary-button thread-primary-action" type="submit" disabled={busy}>
+                {busy ? "준비 중..." : "채팅방 만들고 검수 시작"}
+              </button>
+            </div>
+          </form>
+        </section>
+      </main>
     </div>
   );
 }
