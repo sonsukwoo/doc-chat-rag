@@ -118,6 +118,7 @@ export interface ChatDebugTrace {
   query_kind?: string;
   selection_type?: string;
   selection_source?: string;
+  answer_strategy?: string;
   selection_reason?: string;
   selected_document_ids?: string[];
   selected_document_queries?: Record<string, string>;
@@ -141,6 +142,7 @@ export interface ThreadChatHistoryMessage {
   kind: "answer" | "interrupt";
   created_at?: string | null;
   citations?: ChatCitation[];
+  visual_assets?: ChatVisualAsset[];
   evidence_chunks?: ChatEvidenceChunk[];
   retrieval_mode?: string | null;
   debug_trace?: ChatDebugTrace | null;

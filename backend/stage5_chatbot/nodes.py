@@ -172,8 +172,10 @@ def _utc_now_iso() -> str:
 def _build_thread_chat_metadata(
     *,
     created_at: str | None = None,
+    kind: str | None = None,
     citations: list[dict[str, Any]] | None = None,
     evidence_chunks: list[dict[str, Any]] | None = None,
+    visual_asset_refs: list[str] | None = None,
     retrieval_mode: str | None = None,
     debug_trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -181,15 +183,61 @@ def _build_thread_chat_metadata(
     payload: dict[str, Any] = {
         "created_at": created_at or _utc_now_iso(),
     }
+    if kind is not None:
+        payload["kind"] = kind
     if citations is not None:
         payload["citations"] = citations
     if evidence_chunks is not None:
         payload["evidence_chunks"] = evidence_chunks
+    if visual_asset_refs is not None:
+        payload["visual_asset_refs"] = visual_asset_refs
     if retrieval_mode is not None:
         payload["retrieval_mode"] = retrieval_mode
     if debug_trace is not None:
         payload["debug_trace"] = debug_trace
     return {"thread_chat": payload}
+
+
+def _format_interrupt_content(payload: dict[str, Any]) -> str:
+    parts = [
+        str(payload.get("question") or "").strip(),
+        str(payload.get("reason") or "").strip(),
+    ]
+    return "\n\n".join(part for part in parts if part)
+
+
+def _build_interrupt_history_message(payload: dict[str, Any]) -> AIMessage | None:
+    interrupt_content = _format_interrupt_content(payload)
+    if not interrupt_content:
+        return None
+    return AIMessage(
+        content=interrupt_content,
+        name="stage5_clarification",
+        additional_kwargs=_build_thread_chat_metadata(kind="interrupt"),
+    )
+
+
+def _has_matching_interrupt_history(
+    messages: list[Any],
+    payload: dict[str, Any],
+) -> bool:
+    interrupt_content = _format_interrupt_content(payload)
+    if not interrupt_content:
+        return False
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            break
+        if not isinstance(message, AIMessage):
+            continue
+        metadata = dict(getattr(message, "additional_kwargs", {}) or {}).get(
+            "thread_chat"
+        )
+        if not isinstance(metadata, dict):
+            break
+        if str(metadata.get("kind") or "").strip() != "interrupt":
+            break
+        return str(message.content or "").strip() == interrupt_content
+    return False
 FOLLOW_UP_DOCUMENT_MARKERS = (
     "그중",
     "그럼",
@@ -205,10 +253,14 @@ FOLLOW_UP_DOCUMENT_MARKERS = (
 
 
 def _get_latest_user_text(state: ChatbotState) -> str:
+    resumed_query = str(state.get("user_message") or "").strip()
+    clarification_response = str(state.get("clarification_response") or "").strip()
+    if resumed_query and clarification_response:
+        return resumed_query
     for message in reversed(state.get("messages") or []):
         if isinstance(message, HumanMessage) and isinstance(message.content, str):
             return message.content.strip()
-    return str(state.get("user_message") or "").strip()
+    return resumed_query
 
 
 def _get_latest_ai_message(state: ChatbotState) -> AIMessage | None:
@@ -265,6 +317,28 @@ def _parse_tool_message_json(message: ToolMessage) -> dict[str, Any] | None:
 
 def _normalize_string_list(values: Any) -> list[str]:
     return [str(item).strip() for item in values or [] if str(item).strip()]
+
+
+def _build_recent_dialog_lines(
+    state: ChatbotState,
+    *,
+    limit: int = 6,
+) -> list[str]:
+    dialog_messages = [
+        message
+        for message in state.get("messages") or []
+        if isinstance(message, (HumanMessage, AIMessage))
+        and isinstance(message.content, str)
+        and message.content.strip()
+    ]
+    if not dialog_messages:
+        return []
+
+    lines: list[str] = []
+    for message in dialog_messages[-limit:]:
+        role = "사용자" if isinstance(message, HumanMessage) else "assistant"
+        lines.append(f"{role}: {_truncate_text(message.content, limit=96)}")
+    return lines
 
 
 def _normalize_optional_int(value: Any) -> int | None:
@@ -677,6 +751,45 @@ def _build_evidence_chunks(
     return evidence_chunks
 
 
+def _select_inline_visual_asset_refs(
+    retrieval_hits: list[dict[str, Any]],
+    *,
+    candidate_hit_limit: int = 3,
+    asset_limit: int = 1,
+) -> list[str]:
+    asset_refs: list[str] = []
+    for hit in retrieval_hits[: max(1, candidate_hit_limit)]:
+        document_id = str(hit.get("document_id") or "").strip()
+        chunk_id = str(hit.get("chunk_id") or "").strip()
+        asset_relative_path = str(hit.get("asset_relative_path") or "").strip()
+        if not document_id or not chunk_id or not asset_relative_path:
+            continue
+        asset_ref = f"{document_id}:{chunk_id}"
+        if asset_ref in asset_refs:
+            continue
+        asset_refs.append(asset_ref)
+        if len(asset_refs) >= asset_limit:
+            break
+    return asset_refs
+
+
+def _build_interrupt_metadata(
+    state: ChatbotState,
+    *,
+    retrieval_hits: list[dict[str, Any]],
+    final_log_entry: str,
+) -> dict[str, Any]:
+    return {
+        "citations": _build_citations(retrieval_hits),
+        "evidence_chunks": _build_evidence_chunks(retrieval_hits),
+        "visual_asset_refs": _select_inline_visual_asset_refs(retrieval_hits),
+        "debug_trace": _build_debug_trace(
+            state,
+            final_log_entries=[final_log_entry],
+        ),
+    }
+
+
 def _get_active_document_ids(state: ChatbotState) -> list[str]:
     return [
         str(item).strip()
@@ -871,7 +984,7 @@ def _should_invoke_llm_document_selection(
     if not _has_rich_document_profiles(state):
         return False
     query_kind = str(query_analysis.get("query_kind") or "").strip()
-    if query_kind in {"smalltalk", "conversation_memory"}:
+    if query_kind == "smalltalk":
         return False
     return True
 
@@ -973,6 +1086,10 @@ def _apply_llm_document_selection(
                     thread_name=str(state.get("thread_name") or "").strip() or None,
                     query_text=query_text,
                     document_profiles=ordered_profiles,
+                    conversation_summary=(
+                        str(state.get("conversation_summary") or "").strip() or None
+                    ),
+                    recent_dialog_lines=_build_recent_dialog_lines(state),
                 )
             ),
         ]
@@ -988,7 +1105,7 @@ def _apply_llm_document_selection(
         base_query_analysis.get("selection_type") or "thread_wide"
     )
     if selection_type == "single_document" and not selected_document_ids:
-        selection_type = "clarification_needed"
+        selection_type = "thread_wide"
     if selection_type == "thread_wide":
         selected_document_ids = _get_active_document_ids(state)
 
@@ -1015,25 +1132,38 @@ def _apply_llm_document_selection(
     answer_strategy = str(result.answer_strategy or "").strip() or str(
         base_query_analysis.get("answer_strategy") or "retrieve_chunks"
     )
-    if answer_strategy not in {"profile_only", "retrieve_chunks"}:
+    if answer_strategy not in {
+        "profile_only",
+        "retrieve_chunks",
+        "conversation_memory",
+        "direct",
+    }:
         answer_strategy = "retrieve_chunks"
     query_kind = str(base_query_analysis.get("query_kind") or "document_grounded")
     needs_clarification = False
     reason = str(base_query_analysis.get("reason") or "").strip()
-    if selection_type == "open_domain":
+    clarification_question = (
+        str(result.clarification_question or "").strip() or None
+    )
+
+    if selection_type == "conversation_memory" or answer_strategy == "conversation_memory":
+        query_kind = "conversation_memory"
+        selected_document_ids = []
+        normalized_document_queries = {}
+        use_per_document_search = False
+        retrieval_mode_hint = None
+        answer_strategy = "conversation_memory"
+        selection_type = "conversation_memory"
+        reason = reason or "현재 스레드 대화 메모를 기준으로 답해야 하는 질문입니다."
+    elif selection_type == "open_domain" or answer_strategy == "direct":
         query_kind = "open_domain_unrelated"
         selected_document_ids = []
         normalized_document_queries = {}
         use_per_document_search = False
         retrieval_mode_hint = None
-        answer_strategy = "retrieve_chunks"
+        answer_strategy = "direct"
+        selection_type = "open_domain"
         reason = reason or "문서 프로파일 기준으로는 일반 질문으로 판단했습니다."
-    elif selection_type == "clarification_needed":
-        query_kind = "ambiguous"
-        needs_clarification = True
-        retrieval_mode_hint = None
-        answer_strategy = "retrieve_chunks"
-        reason = reason or "문서 프로파일만으로는 질문 대상을 확정하기 어렵습니다."
     else:
         if query_kind not in {"lexical", "document_grounded"}:
             query_kind = "document_grounded"
@@ -1061,6 +1191,7 @@ def _apply_llm_document_selection(
         "document_match_score": float(
             base_query_analysis.get("document_match_score") or 0.0
         ),
+        "clarification_question": clarification_question,
     }
 
 
@@ -1119,15 +1250,6 @@ def _should_force_clarification(
     active_document_ids = _get_active_document_ids(state)
     if not active_document_ids:
         return True, "현재 스레드에 연결된 문서가 없습니다."
-
-    if (
-        len(active_document_ids) > 1
-        and len(selected_document_ids) != 1
-        and query_text
-        and any(marker in query_text for marker in STRONG_DEICTIC_DOCUMENT_MARKERS)
-    ):
-        if not any(marker in query_text for marker in MULTI_DOCUMENT_SCOPE_MARKERS):
-            return True, "여러 문서가 연결된 상태에서 질문 대상 문서가 모호합니다."
 
     return False, ""
 
@@ -1286,6 +1408,52 @@ def _build_memory_context_text(state: ChatbotState) -> str:
     return "\n\n".join(parts).strip()
 
 
+def _build_missing_evidence_clarification_payload(
+    state: ChatbotState,
+    *,
+    query_text: str,
+    selected_document_count: int,
+) -> dict[str, Any]:
+    profile_labels: list[str] = []
+    for profile in _iter_ordered_document_profiles(state):
+        original_filename = str(profile.get("original_filename") or "").strip()
+        title = str(profile.get("title") or "").strip()
+        if original_filename:
+            profile_labels.append(original_filename)
+        elif title:
+            profile_labels.append(title)
+        if len(profile_labels) >= 3:
+            break
+
+    joined_labels = ", ".join(profile_labels)
+    if len(_get_active_document_ids(state)) > 1 and selected_document_count != 1:
+        question = "현재 검색된 청크만으로는 어느 문서를 봐야 할지 확정하기 어렵습니다."
+        if joined_labels:
+            question += f" 기준 문서를 지정해주세요. 예: {joined_labels}"
+        else:
+            question += " 기준 문서를 지정해주세요."
+    elif len(_get_active_document_ids(state)) > 1:
+        question = (
+            "현재 선택된 문서 청크에서 바로 답할 근거를 찾지 못했습니다. "
+            "다른 문서를 말한 것이라면 문서를 지정하거나, 페이지/표 제목/키워드를 더 알려주세요."
+        )
+    else:
+        question = (
+            "현재 검색된 문서 청크에서 바로 답할 근거를 찾지 못했습니다. "
+            "페이지, 표 제목, 섹션명, 키워드처럼 조금 더 구체적으로 말씀해주세요."
+        )
+
+    return {
+        "kind": "clarification",
+        "question": question,
+        "reason": (
+            "현재 검색된 청크가 질문과 직접 맞지 않거나, 답변에 필요한 근거가 부족합니다."
+        ),
+        "options": _get_active_document_ids(state),
+        "query_text": query_text,
+    }
+
+
 def _build_query_analysis(state: ChatbotState, query_text: str) -> QueryAnalysisPayload:
     lowered = _normalize_match_text(query_text)
     thread_scope_matched, matched_thread_terms = _query_matches_thread_scope(
@@ -1337,12 +1505,14 @@ def _build_query_analysis(state: ChatbotState, query_text: str) -> QueryAnalysis
         reason = "simple conversational query"
         selection_type = "open_domain"
         use_per_document_search = False
+        answer_strategy: QueryAnalysisPayload["answer_strategy"] = "direct"
     elif _is_conversation_memory_query(query_text):
         query_kind = "conversation_memory"
         needs_clarification = False
         reason = "query refers to prior conversation memory"
-        selection_type = "open_domain"
+        selection_type = "conversation_memory"
         use_per_document_search = False
+        answer_strategy = "conversation_memory"
     else:
         has_lexical_marker = any(token in lowered for token in LEXICAL_REFERENCE_MARKERS)
         has_document_marker = any(
@@ -1393,9 +1563,14 @@ def _build_query_analysis(state: ChatbotState, query_text: str) -> QueryAnalysis
             reason = "query is not related to the current document scope"
             selection_type = "open_domain"
             use_per_document_search = False
+        answer_strategy = (
+            "direct"
+            if query_kind == "open_domain_unrelated"
+            else "retrieve_chunks"
+        )
 
     return {
-        "answer_strategy": None,
+        "answer_strategy": answer_strategy,
         "query_text": query_text,
         "query_kind": query_kind,
         "needs_clarification": needs_clarification,
@@ -1415,6 +1590,7 @@ def _build_query_analysis(state: ChatbotState, query_text: str) -> QueryAnalysis
             ],
         ],
         "document_match_score": document_match_score,
+        "clarification_question": None,
     }
 
 
@@ -1451,6 +1627,15 @@ def _build_retrieval_policy(
 def load_request_context(state: ChatbotState) -> dict[str, Any]:
     """외부 입력을 챗봇 state 기본 구조에 맞게 정리한다."""
     normalized_user_message = str(state.get("user_message") or "").strip()
+    unresolved_clarification_payload = dict(state.get("clarification_payload") or {})
+    should_persist_unresolved_interrupt = bool(
+        state.get("needs_clarification")
+        and unresolved_clarification_payload
+        and not _has_matching_interrupt_history(
+            list(state.get("messages") or []),
+            unresolved_clarification_payload,
+        )
+    )
     updates: dict[str, Any] = {
         "logs": ["load_request_context"],
         "log_cursor": len(list(state.get("logs") or [])),
@@ -1458,8 +1643,10 @@ def load_request_context(state: ChatbotState) -> dict[str, Any]:
         "expanded_context_blocks": [],
         "citations": [],
         "evidence_chunks": [],
+        "visual_asset_refs": [],
         "answer_draft": None,
         "final_answer": None,
+        "debug_trace": None,
         "grounding_decision": {
             "action": "retrieve_deeper",
             "clarification_question": None,
@@ -1467,6 +1654,7 @@ def load_request_context(state: ChatbotState) -> dict[str, Any]:
         "clarification_payload": None,
         "clarification_response": None,
         "needs_clarification": False,
+        "deep_retrieval_attempted": False,
         "retrieval_document_ids": _get_active_document_ids(state),
         "retrieval_document_queries": {},
         "use_per_document_search": False,
@@ -1475,6 +1663,14 @@ def load_request_context(state: ChatbotState) -> dict[str, Any]:
     current_messages = list(state.get("messages") or [])
     last_message = current_messages[-1] if current_messages else None
     appended_messages: list[Any] = list(current_messages)
+    new_messages: list[Any] = []
+    if should_persist_unresolved_interrupt:
+        interrupt_message = _build_interrupt_history_message(
+            unresolved_clarification_payload
+        )
+        if interrupt_message is not None:
+            new_messages.append(interrupt_message)
+            appended_messages.append(interrupt_message)
     if normalized_user_message and not (
         isinstance(last_message, HumanMessage)
         and isinstance(last_message.content, str)
@@ -1485,8 +1681,10 @@ def load_request_context(state: ChatbotState) -> dict[str, Any]:
             content=normalized_user_message,
             additional_kwargs=_build_thread_chat_metadata(created_at=created_at),
         )
-        updates["messages"] = [user_message]
+        new_messages.append(user_message)
         appended_messages.append(user_message)
+    if new_messages:
+        updates["messages"] = new_messages
 
     merged_user_facts = dict(state.get("user_facts") or {})
     merged_user_facts.update(_extract_user_facts_from_message(normalized_user_message))
@@ -1579,9 +1777,12 @@ def clarify_if_needed(state: ChatbotState) -> dict[str, Any]:
     options = _get_active_document_ids(state)
     payload = dict(state.get("clarification_payload") or {})
     if not payload:
+        clarification_question = (
+            str(query_analysis.get("clarification_question") or "").strip() or None
+        )
         payload = {
             "kind": "clarification",
-            "question": "어떤 문서를 기준으로 답할까요?",
+            "question": clarification_question or "어떤 문서를 기준으로 답할까요?",
             "reason": str(query_analysis.get("reason") or "질문 범위를 확정해야 합니다."),
             "options": options,
         }
@@ -1591,6 +1792,13 @@ def clarify_if_needed(state: ChatbotState) -> dict[str, Any]:
     updated_document_ids = options
     resumed_messages: list[Any] = []
     updated_user_message = state.get("user_message")
+    if normalized_response and not _has_matching_interrupt_history(
+        list(state.get("messages") or []),
+        payload,
+    ):
+        interrupt_message = _build_interrupt_history_message(payload)
+        if interrupt_message is not None:
+            resumed_messages.append(interrupt_message)
     if normalized_response and normalized_response in payload_options:
         updated_document_ids = [normalized_response]
     elif normalized_response:
@@ -1598,13 +1806,15 @@ def clarify_if_needed(state: ChatbotState) -> dict[str, Any]:
             f"{str(state.get('user_message') or _get_latest_user_text(state)).strip()}\n\n"
             f"추가 정보:\n{normalized_response}"
         ).strip()
-        resumed_messages = [
-            HumanMessage(
-                content=combined_query,
-                additional_kwargs=_build_thread_chat_metadata(),
-            )
-        ]
         updated_user_message = combined_query
+    if normalized_response:
+        resumed_messages = [
+            *resumed_messages,
+            HumanMessage(
+                content=normalized_response,
+                additional_kwargs=_build_thread_chat_metadata(),
+            ),
+        ]
     return {
         "clarification_payload": payload,
         "clarification_response": normalized_response,
@@ -1654,6 +1864,40 @@ def build_agent_llm_node(
             )
         prompt_messages.extend(_build_model_input_messages(state))
         response = bound_llm.invoke(prompt_messages)
+        answer_strategy = str(
+            (state.get("query_analysis") or {}).get("answer_strategy") or ""
+        ).strip()
+        current_turn_has_tool_result = bool(
+            _iter_tool_messages(state, current_turn_only=True)
+        )
+        if (
+            answer_strategy == "retrieve_chunks"
+            and not current_turn_has_tool_result
+            and not getattr(response, "tool_calls", None)
+        ):
+            forced_query = str(
+                (state.get("query_analysis") or {}).get("query_text")
+                or _get_latest_user_text(state)
+                or state.get("user_message")
+                or ""
+            ).strip()
+            if forced_query:
+                forced_tool_call = AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "search_thread_knowledge",
+                            "args": {"query": forced_query},
+                            "id": "forced-search-thread-knowledge",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+                return {
+                    "answer_draft": None,
+                    "messages": [forced_tool_call],
+                    "logs": ["agent_llm:forced_search"],
+                }
         answer_draft = None
         if isinstance(response.content, str):
             answer_draft = response.content.strip() or None
@@ -1772,6 +2016,7 @@ def build_direct_response_node(
             },
             "citations": [],
             "evidence_chunks": [],
+            "visual_asset_refs": [],
             "messages": [
                 AIMessage(
                     content=final_answer,
@@ -1779,6 +2024,7 @@ def build_direct_response_node(
                     additional_kwargs=_build_thread_chat_metadata(
                         citations=[],
                         evidence_chunks=[],
+                        visual_asset_refs=[],
                         retrieval_mode=debug_trace.get("retrieval_mode"),
                         debug_trace=debug_trace,
                     ),
@@ -1848,6 +2094,7 @@ def build_profile_answer_node(
             },
             "citations": [],
             "evidence_chunks": [],
+            "visual_asset_refs": [],
             "messages": [
                 AIMessage(
                     content=final_answer,
@@ -1855,6 +2102,7 @@ def build_profile_answer_node(
                     additional_kwargs=_build_thread_chat_metadata(
                         citations=[],
                         evidence_chunks=[],
+                        visual_asset_refs=[],
                         debug_trace=debug_trace,
                     ),
                 )
@@ -1936,6 +2184,12 @@ def build_grounding_check_node(
         latest_search_payload = _extract_latest_search_payload(state)
         query_analysis = dict(state.get("query_analysis") or {})
         query_kind = str(query_analysis.get("query_kind") or "general").strip()
+        deep_retrieval_attempted = bool(state.get("deep_retrieval_attempted"))
+        available_document_count = len(_get_active_document_ids(state))
+        selected_document_count = len(_get_retrieval_document_ids(state))
+        query_text = str(
+            query_analysis.get("query_text") or _get_latest_user_text(state)
+        ).strip()
         retrieval_hits = list(
             (latest_search_payload or {}).get("retrievals")
             or state.get("retrieval_hits")
@@ -1950,44 +2204,102 @@ def build_grounding_check_node(
         answer_draft = str(state.get("answer_draft") or "").strip()
 
         if not retrieval_hits:
-            action = "retrieve_deeper"
+            if (
+                query_kind in {"lexical", "document_grounded", "ambiguous"}
+                and (has_any_tool_result or deep_retrieval_attempted)
+            ):
+                clarification_payload = _build_missing_evidence_clarification_payload(
+                    state,
+                    query_text=query_text,
+                    selected_document_count=selected_document_count,
+                )
+                interrupt_metadata = _build_interrupt_metadata(
+                    state,
+                    retrieval_hits=retrieval_hits,
+                    final_log_entry="grounding_check:clarify:missing_evidence",
+                )
+                return {
+                    "retrieval_hits": retrieval_hits,
+                    "expanded_context_blocks": expanded_context_blocks,
+                    "grounding_decision": {
+                        "action": "clarify",
+                        "clarification_question": clarification_payload["question"],
+                    },
+                    "clarification_payload": clarification_payload,
+                    "clarification_response": None,
+                    "needs_clarification": True,
+                    **interrupt_metadata,
+                    "logs": ["grounding_check:clarify:missing_evidence"],
+                }
             if query_kind in {
                 "smalltalk",
                 "conversation_memory",
                 "open_domain_unrelated",
             } and answer_draft:
-                action = "answer"
-            elif query_kind == "ambiguous":
-                action = "clarify"
-
-            decision: GroundingDecisionPayload = {
-                "action": action,
-                "clarification_question": (
-                    "어떤 문서를 기준으로 답할까요?"
-                    if action == "clarify"
-                    else None
-                ),
-            }
-            clarification_payload = None
-            if action == "clarify":
-                clarification_payload = {
-                    "kind": "clarification",
-                    "question": (
-                        decision.get("clarification_question")
-                        or "어떤 문서를 기준으로 답할까요?"
-                    ),
-                    "reason": "질문 대상 문서나 범위를 먼저 확정해야 합니다.",
-                    "options": [],
+                decision: GroundingDecisionPayload = {
+                    "action": "answer",
+                    "clarification_question": None,
                 }
+                clarification_payload = None
+                decision_source = "deterministic"
+            else:
+                result = structured_grounding_llm.invoke(
+                    [
+                        SystemMessage(content=build_stage5_grounding_system_prompt()),
+                        HumanMessage(
+                            content=build_stage5_grounding_user_prompt(
+                                query_text=query_text,
+                                answer_draft=answer_draft or None,
+                                context_blocks=[],
+                                selection_type=str(
+                                    query_analysis.get("selection_type") or ""
+                                ).strip()
+                                or None,
+                                available_document_count=available_document_count,
+                                selected_document_count=selected_document_count,
+                                deep_retrieval_attempted=deep_retrieval_attempted,
+                            )
+                        ),
+                    ]
+                )
+                decision = result.model_dump()
+                clarification_payload = None
+                if result.action == "clarify":
+                    clarification_payload = {
+                        "kind": "clarification",
+                        "question": (
+                            result.clarification_question
+                            or str(
+                                query_analysis.get("clarification_question") or ""
+                            ).strip()
+                            or "어떤 문서를 기준으로 답할까요?"
+                        ),
+                        "reason": "질문 대상 문서나 범위를 먼저 확정해야 합니다.",
+                        "options": [],
+                    }
+                decision_source = "llm"
+            interrupt_metadata = (
+                _build_interrupt_metadata(
+                    state,
+                    retrieval_hits=retrieval_hits,
+                    final_log_entry=(
+                        f"grounding_check:{decision.get('action') or 'answer'}:{decision_source}"
+                    ),
+                )
+                if decision.get("action") == "clarify"
+                else {}
+            )
             return {
                 "retrieval_hits": retrieval_hits,
                 "expanded_context_blocks": expanded_context_blocks,
                 "grounding_decision": decision,
                 "clarification_payload": clarification_payload,
-                "needs_clarification": action == "clarify",
-                "logs": [
-                    f"grounding_check:{action}:deterministic"
-                ],
+                "clarification_response": None
+                if decision.get("action") == "clarify"
+                else None,
+                "needs_clarification": decision.get("action") == "clarify",
+                **interrupt_metadata,
+                "logs": [f"grounding_check:{decision.get('action') or 'answer'}:{decision_source}"],
             }
 
         if (
@@ -1996,6 +2308,30 @@ def build_grounding_check_node(
             and query_kind in {"lexical", "document_grounded"}
             and _answer_draft_signals_insufficient(answer_draft)
         ):
+            if deep_retrieval_attempted:
+                clarification_payload = _build_missing_evidence_clarification_payload(
+                    state,
+                    query_text=query_text,
+                    selected_document_count=selected_document_count,
+                )
+                interrupt_metadata = _build_interrupt_metadata(
+                    state,
+                    retrieval_hits=retrieval_hits,
+                    final_log_entry="grounding_check:clarify:insufficient_after_deep",
+                )
+                return {
+                    "retrieval_hits": retrieval_hits,
+                    "expanded_context_blocks": expanded_context_blocks,
+                    "grounding_decision": {
+                        "action": "clarify",
+                        "clarification_question": clarification_payload["question"],
+                    },
+                    "clarification_payload": clarification_payload,
+                    "clarification_response": None,
+                    "needs_clarification": True,
+                    **interrupt_metadata,
+                    "logs": ["grounding_check:clarify:insufficient_after_deep"],
+                }
             return {
                 "retrieval_hits": retrieval_hits,
                 "expanded_context_blocks": expanded_context_blocks,
@@ -2008,9 +2344,6 @@ def build_grounding_check_node(
                 "logs": ["grounding_check:retrieve_deeper:deterministic"],
             }
 
-        query_text = str(
-            query_analysis.get("query_text") or _get_latest_user_text(state)
-        ).strip()
         result = structured_grounding_llm.invoke(
             [
                 SystemMessage(content=build_stage5_grounding_system_prompt()),
@@ -2019,10 +2352,41 @@ def build_grounding_check_node(
                         query_text=query_text,
                         answer_draft=answer_draft or None,
                         context_blocks=expanded_context_blocks,
+                        selection_type=str(
+                            query_analysis.get("selection_type") or ""
+                        ).strip()
+                        or None,
+                        available_document_count=available_document_count,
+                        selected_document_count=selected_document_count,
+                        deep_retrieval_attempted=deep_retrieval_attempted,
                     )
                 ),
             ]
         )
+        if result.action == "retrieve_deeper" and deep_retrieval_attempted:
+            clarification_payload = _build_missing_evidence_clarification_payload(
+                state,
+                query_text=query_text,
+                selected_document_count=selected_document_count,
+            )
+            interrupt_metadata = _build_interrupt_metadata(
+                state,
+                retrieval_hits=retrieval_hits,
+                final_log_entry="grounding_check:clarify:deeper_exhausted",
+            )
+            return {
+                "retrieval_hits": retrieval_hits,
+                "expanded_context_blocks": expanded_context_blocks,
+                "grounding_decision": {
+                    "action": "clarify",
+                    "clarification_question": clarification_payload["question"],
+                },
+                "needs_clarification": True,
+                "clarification_payload": clarification_payload,
+                "clarification_response": None,
+                **interrupt_metadata,
+                "logs": ["grounding_check:clarify:deeper_exhausted"],
+            }
         decision = result.model_dump()
         clarification_payload = None
         if result.action == "clarify":
@@ -2035,6 +2399,15 @@ def build_grounding_check_node(
                 "reason": "질문 대상 문서나 범위를 먼저 확정해야 합니다.",
                 "options": [],
             }
+        interrupt_metadata = (
+            _build_interrupt_metadata(
+                state,
+                retrieval_hits=retrieval_hits,
+                final_log_entry=f"grounding_check:{result.action}:llm",
+            )
+            if result.action == "clarify"
+            else {}
+        )
 
         return {
             "retrieval_hits": retrieval_hits,
@@ -2042,6 +2415,8 @@ def build_grounding_check_node(
             "grounding_decision": decision,
             "needs_clarification": result.action == "clarify",
             "clarification_payload": clarification_payload,
+            "clarification_response": None if result.action == "clarify" else None,
+            **interrupt_metadata,
             "logs": [f"grounding_check:{result.action}:llm"],
         }
 
@@ -2123,6 +2498,7 @@ def build_fallback_or_retrieve_deeper_node(
             return {
                 "retrieval_hits": [],
                 "expanded_context_blocks": [],
+                "deep_retrieval_attempted": True,
                 "answer_draft": "현재 연결된 문서에서 관련 근거를 찾지 못했습니다.",
                 "logs": [f"fallback_or_retrieve_deeper:empty:{base_mode}"],
             }
@@ -2134,6 +2510,7 @@ def build_fallback_or_retrieve_deeper_node(
                 retrieval_hits=retrieval_hits,
                 context_window_loader=context_window_loader,
             ),
+            "deep_retrieval_attempted": True,
             "answer_draft": None,
             "logs": [
                 f"fallback_or_retrieve_deeper:retrieved:{base_mode}:{len(retrieval_hits)}"
@@ -2154,6 +2531,7 @@ def build_compose_answer_with_citations_node(
         retrieval_hits = list(state.get("retrieval_hits") or [])
         citations = _build_citations(retrieval_hits)
         evidence_chunks = _build_evidence_chunks(retrieval_hits)
+        visual_asset_refs = _select_inline_visual_asset_refs(retrieval_hits)
         answer_draft = str(state.get("answer_draft") or "").strip()
 
         if retrieval_hits:
@@ -2187,6 +2565,7 @@ def build_compose_answer_with_citations_node(
             "final_answer": final_answer,
             "citations": citations,
             "evidence_chunks": evidence_chunks,
+            "visual_asset_refs": visual_asset_refs,
             "debug_trace": _build_debug_trace(
                 state,
                 final_log_entries=["compose_answer_with_citations"],
@@ -2200,6 +2579,7 @@ def build_compose_answer_with_citations_node(
                 additional_kwargs=_build_thread_chat_metadata(
                     citations=citations,
                     evidence_chunks=evidence_chunks,
+                    visual_asset_refs=visual_asset_refs,
                     retrieval_mode=(
                         str(
                             ((_extract_latest_search_payload(state) or {}).get("retrieval_mode"))
@@ -2219,13 +2599,13 @@ def build_compose_answer_with_citations_node(
 
 def route_after_classification(state: ChatbotState) -> str:
     """질문 분류 결과에 따라 다음 노드를 고른다."""
-    if state.get("needs_clarification"):
-        return "clarify_if_needed"
     answer_strategy = str(
         (state.get("query_analysis") or {}).get("answer_strategy") or ""
     ).strip()
     if answer_strategy == "profile_only":
         return "respond_from_profiles"
+    if answer_strategy in {"conversation_memory", "direct"}:
+        return "respond_without_documents"
     query_kind = str((state.get("query_analysis") or {}).get("query_kind") or "")
     if query_kind in {
         "smalltalk",
@@ -2255,5 +2635,7 @@ def route_after_grounding(state: ChatbotState) -> str:
     if action == "clarify":
         return "clarify_if_needed"
     if action == "retrieve_deeper":
+        if bool(state.get("deep_retrieval_attempted")):
+            return "compose_answer_with_citations"
         return "fallback_or_retrieve_deeper"
     return "compose_answer_with_citations"

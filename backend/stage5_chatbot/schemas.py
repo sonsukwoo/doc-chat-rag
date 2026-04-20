@@ -89,6 +89,7 @@ class ChatbotDebugTracePayload(TypedDict, total=False):
     query_kind: str
     selection_type: str
     selection_source: str
+    answer_strategy: str
     selection_reason: str
     selected_document_ids: list[str]
     selected_document_queries: dict[str, str]
@@ -125,6 +126,7 @@ class Stage5Output(TypedDict, total=False):
     final_answer: str | None
     citations: list[ChatbotCitationPayload]
     visual_assets: list[ChatbotVisualAssetPayload]
+    visual_asset_refs: list[str]
     evidence_chunks: list[ChatbotEvidenceChunkPayload]
     interrupt: ChatbotInterruptPayload | None
     retrieval_mode: str

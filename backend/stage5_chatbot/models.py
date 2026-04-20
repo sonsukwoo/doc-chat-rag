@@ -15,12 +15,12 @@ class DocumentSelectionResult(BaseModel):
         "multi_document",
         "comparison",
         "thread_wide",
+        "conversation_memory",
         "open_domain",
-        "clarification_needed",
     ] = Field(
         description=(
             "질문 유형. single_document, multi_document, comparison, "
-            "thread_wide, open_domain, clarification_needed 중 하나."
+            "thread_wide, conversation_memory, open_domain 중 하나."
         )
     )
     selected_document_ids: list[str] = Field(
@@ -39,12 +39,25 @@ class DocumentSelectionResult(BaseModel):
             "문서 검색이 필요할 때 권장 검색 모드. 확실하지 않으면 null."
         ),
     )
-    answer_strategy: Literal["profile_only", "retrieve_chunks"] | None = Field(
+    answer_strategy: Literal[
+        "profile_only",
+        "retrieve_chunks",
+        "conversation_memory",
+        "direct",
+    ] | None = Field(
         default=None,
         description=(
             "문서 프로파일만으로 답할 수 있으면 profile_only, "
             "실제 문서 청크 검색이 필요하면 retrieve_chunks, "
+            "대화 메모를 기반으로 답해야 하면 conversation_memory, "
+            "문서와 무관한 일반 답변이면 direct, "
             "확실하지 않으면 null."
+        ),
+    )
+    clarification_question: str | None = Field(
+        default=None,
+        description=(
+            "현재는 사용하지 않는 필드. 특별한 질문이 없으면 null."
         ),
     )
 

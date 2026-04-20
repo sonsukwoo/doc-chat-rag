@@ -41,15 +41,21 @@ class QueryAnalysisPayload(TypedDict, total=False):
         "multi_document",
         "comparison",
         "thread_wide",
+        "conversation_memory",
         "open_domain",
-        "clarification_needed",
     ]
     selection_source: Literal["deterministic", "llm", "fallback"]
-    answer_strategy: Literal["profile_only", "retrieve_chunks"] | None
+    answer_strategy: Literal[
+        "profile_only",
+        "retrieve_chunks",
+        "conversation_memory",
+        "direct",
+    ] | None
     retrieval_mode_hint: Literal["dense", "hybrid"] | None
     use_per_document_search: bool
     matched_profile_topics: list[str]
     document_match_score: float
+    clarification_question: str | None
 
 
 class RetrievalPolicyPayload(TypedDict, total=False):
@@ -100,7 +106,9 @@ class ChatbotState(TypedDict, total=False):
     needs_clarification: bool
     clarification_payload: ChatbotInterruptPayload | None
     clarification_response: str | None
+    deep_retrieval_attempted: bool
     answer_draft: str | None
     final_answer: str | None
+    visual_asset_refs: list[str]
     debug_trace: ChatbotDebugTracePayload | None
     logs: Annotated[list[str], operator.add]

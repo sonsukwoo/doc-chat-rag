@@ -32,6 +32,24 @@ def _normalize_interrupt(payload: Any) -> dict[str, Any] | None:
     return {"kind": "clarification", "question": str(value or payload)}
 
 
+def _resolve_active_interrupt(result: dict[str, Any]) -> dict[str, Any] | None:
+    needs_clarification = bool(result.get("needs_clarification"))
+    if not needs_clarification:
+        return None
+
+    clarification_payload = _normalize_interrupt(result.get("clarification_payload"))
+    if clarification_payload is not None:
+        return clarification_payload
+
+    raw_interrupts = list(result.get("__interrupt__") or [])
+    if not raw_interrupts:
+        clarification_response = str(result.get("clarification_response") or "").strip()
+        if clarification_response:
+            return None
+        return None
+    return _normalize_interrupt(raw_interrupts[0])
+
+
 def _dedupe_asset_refs(citations: list[dict[str, Any]]) -> list[str]:
     seen: set[str] = set()
     ordered: list[str] = []
@@ -164,13 +182,16 @@ def run_stage5_chatbot(
             )
             result = graph.invoke(graph_command, config=config)
 
-    interrupt_payload = None
-    raw_interrupts = result.get("__interrupt__") or []
-    if raw_interrupts:
-        interrupt_payload = _normalize_interrupt(raw_interrupts[0])
+    interrupt_payload = _resolve_active_interrupt(result)
 
     citations = list(result.get("citations") or [])
-    asset_refs = _dedupe_asset_refs(citations)
+    asset_refs = [
+        str(item).strip()
+        for item in result.get("visual_asset_refs") or []
+        if str(item).strip()
+    ]
+    if not asset_refs:
+        asset_refs = _dedupe_asset_refs(citations)
     visual_assets = []
     if asset_refs:
         visual_assets = visual_asset_loader(
@@ -185,6 +206,7 @@ def run_stage5_chatbot(
         "final_answer": result.get("final_answer"),
         "citations": citations,
         "visual_assets": visual_assets,
+        "visual_asset_refs": asset_refs,
         "evidence_chunks": list(result.get("evidence_chunks") or []),
         "interrupt": interrupt_payload,
         "retrieval_mode": str(

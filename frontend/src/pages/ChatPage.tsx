@@ -79,11 +79,6 @@ function canChat(thread: ThreadRecord | null, documents: ThreadDocumentRecord[])
   return documents.some((document) => document.stages?.stage3?.status === "completed");
 }
 
-function hasPendingInterrupt(messages: ChatMessage[]): boolean {
-  const lastMessage = messages[messages.length - 1];
-  return lastMessage?.role === "assistant" && lastMessage.kind === "interrupt";
-}
-
 function hydratePersistedMessages(records: ThreadChatHistoryMessage[]): ChatMessage[] {
   return records.map((record, index) => ({
     id: `persisted-${index}-${record.role}`,
@@ -92,6 +87,7 @@ function hydratePersistedMessages(records: ThreadChatHistoryMessage[]): ChatMess
     kind: record.kind,
     createdAt: record.created_at || null,
     citations: record.citations,
+    visualAssets: record.visual_assets,
     evidenceChunks: record.evidence_chunks,
     retrievalMode: record.retrieval_mode || undefined,
     debugTrace: record.debug_trace,
@@ -155,7 +151,6 @@ export function ChatPage() {
   const [inputValue, setInputValue] = useState("");
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
-  const [pendingInterrupt, setPendingInterrupt] = useState(false);
   const [historyNotice, setHistoryNotice] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [showThreadPanel, setShowThreadPanel] = useState(false);
@@ -188,7 +183,6 @@ export function ChatPage() {
     setThread(chatResponse.thread);
     setDocuments(documentsResponse.documents);
     setMessages(nextMessages);
-    setPendingInterrupt(hasPendingInterrupt(nextMessages));
     setHistoryNotice(chatResponse.history_notice || null);
   }
 
@@ -203,7 +197,6 @@ export function ChatPage() {
     setThread(null);
     setDocuments([]);
     setMessages([]);
-    setPendingInterrupt(false);
     setHistoryNotice(null);
     setInputValue("");
     setAppendFile(null);
@@ -265,7 +258,7 @@ export function ChatPage() {
 
   useEffect(() => {
     resizeComposer();
-  }, [inputValue, pendingInterrupt, chatReady]);
+  }, [inputValue, chatReady]);
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== "Enter") {
@@ -278,8 +271,10 @@ export function ChatPage() {
     void handleSendMessage();
   }
 
-  async function handleSendMessage() {
-    const trimmed = inputValue.trim();
+  async function handleSendMessage(options?: {
+    message?: string;
+  }) {
+    const trimmed = String(options?.message ?? inputValue).trim();
     if (!trimmed || !threadId || sending || !chatReady) {
       return;
     }
@@ -302,14 +297,16 @@ export function ChatPage() {
     };
 
     setMessages((current) => [...current, userMessage, pendingMessage]);
-    setInputValue("");
+    if (!options?.message) {
+      setInputValue("");
+    }
     setSending(true);
     setErrorMessage(null);
 
     try {
       const response = await sendThreadChatMessage(activeThreadId, {
         message: trimmed,
-        resume: pendingInterrupt,
+        resume: false,
       });
       const result = response.result;
 
@@ -347,7 +344,6 @@ export function ChatPage() {
         setMessages((current) =>
           current.map((message) => (message.id === pendingMessageId ? assistantMessage : message)),
         );
-        setPendingInterrupt(result.status === "interrupted");
       }
     } catch (error) {
       const message =
@@ -719,9 +715,7 @@ export function ChatPage() {
               placeholder={
                 !chatReady
                   ? "검수와 stage3가 끝나면 질문할 수 있습니다."
-                  : pendingInterrupt
-                    ? "추가 정보를 입력하고 Enter로 보내세요."
-                    : "문서에 대해 질문하세요."
+                  : "문서에 대해 질문하세요."
               }
               disabled={sending || !chatReady}
               rows={1}
@@ -734,7 +728,7 @@ export function ChatPage() {
                 className="chat-send-button"
                 onClick={() => void handleSendMessage()}
                 disabled={sending || !inputValue.trim() || !chatReady}
-                aria-label={sending ? "전송 중" : pendingInterrupt ? "응답 보내기" : "질문 보내기"}
+                aria-label={sending ? "전송 중" : "질문 보내기"}
               >
                 <SendArrowIcon />
               </button>

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from backend.stage5_chatbot.document_selection import extract_numeric_filename_aliases
+
 
 def _render_document_profile_line(profile: dict[str, object]) -> str:
     title = str(profile.get("title") or "").strip()
@@ -60,15 +62,25 @@ def build_stage5_document_selection_system_prompt() -> str:
     """문서 프로파일만 보고 질문 대상 문서를 고를 때 쓰는 시스템 프롬프트."""
     return (
         "당신은 thread-scoped 문서 선택기입니다.\n"
-        "문서 원문 청크는 아직 보지 못했고, 제공된 문서 프로파일만으로 판단해야 합니다.\n"
+        "문서 원문 청크는 아직 보지 못했고, 제공된 문서 프로파일과 대화 메모만으로 판단해야 합니다.\n"
         "반드시 현재 후보 문서 목록에 있는 document_id만 선택하세요.\n"
         "질문이 한 문서만 가리키면 single_document를 선택하세요.\n"
         "질문이 여러 문서를 함께 다루면 multi_document 또는 comparison을 선택하세요.\n"
         "문서 전체를 넓게 훑어야 하면 thread_wide를 선택하세요.\n"
+        "질문이 이전 대화, 직전 답변, 지금까지의 질문/대화를 묻는 경우 conversation_memory를 선택하세요.\n"
         "문서와 무관한 일반 질문이면 open_domain을 선택하세요.\n"
-        "대상을 정할 수 없으면 clarification_needed를 선택하세요.\n"
-        "단일 문서 또는 여러 문서의 설명, 개요, 소개, 상위 요약처럼 문서 프로파일만으로도 답할 수 있으면 answer_strategy를 profile_only로 두세요.\n"
-        "함수 사용법, 인자, 코드 예시, 표/그림, 페이지, 절차, 정확한 수치처럼 원문 근거가 필요하면 answer_strategy를 retrieve_chunks로 두세요.\n"
+        "answer_strategy는 direct, conversation_memory, profile_only, retrieve_chunks 중 하나로 고르세요.\n"
+        "profile_only는 오직 문서 제목, 문서 종류, main_topics, short_summary만으로 답할 수 있을 때만 선택하세요.\n"
+        "사용자가 이전 대화, 지금까지, 방금, 앞서, 내가 물어본, 우리가 이야기한, 직전 답변, 최근 질문처럼 대화 이력을 묻는 경우 절대 profile_only를 선택하지 말고 conversation_memory를 선택하세요.\n"
+        "코드, 함수, 인자, 페이지, 표, 그림, 절차, 수치처럼 원문 근거가 필요하면 retrieve_chunks를 선택하세요.\n"
+        "직전 assistant가 문서 지정을 물었고, 사용자가 '1번 문서야', '2.pdf야', '첫 번째 문서'처럼 짧게 답한 경우에는 그 답을 문서 지정으로 해석해 single_document를 우선 선택하세요.\n"
+        "여러 문서가 연결된 상태에서 표/그림/페이지/섹션 번호만 있고 문서가 특정되지 않으면 thread_wide로 두고 retrieve_chunks를 선택하세요.\n"
+        "여러 문서가 연결된 상태에서 질문이 'Table 14', 'Figure 3', 'p.12', '3장'처럼 참조 번호만 말하고 문서 별칭/제목/파일명이 없으면 절대 특정 문서를 단정하지 말고 thread_wide 검색으로 넘기세요.\n"
+        "예시 1: '1번 문서 요약해줘' -> single_document + profile_only\n"
+        "예시 2: '2.pdf 핵심 주제 설명' -> single_document + profile_only\n"
+        "예시 3: 'create_agent 인자 알려줘' -> single_document 또는 multi_document + retrieve_chunks\n"
+        "예시 4: '지금까지 내가 질문한 것들 요약해줘' -> conversation_memory + conversation_memory\n"
+        "예시 5: 'Figure 4 설명해줘'처럼 문서 지정 없는 참조 질의 -> thread_wide + retrieve_chunks\n"
         "문서별로 다른 검색 질의를 쓰는 편이 좋을 때만 per_document_queries를 채우고, 그렇지 않으면 비워 두세요.\n"
         "retrieval_mode는 기본적으로 null로 두고, 정확 키워드, 함수명, 클래스명, snake_case, CamelCase, 페이지/표/그림처럼 정확 매칭 성격이 강할 때 hybrid를 우선 고려하세요."
     )
@@ -79,25 +91,43 @@ def build_stage5_document_selection_user_prompt(
     thread_name: str | None,
     query_text: str,
     document_profiles: list[dict[str, object]],
+    conversation_summary: str | None = None,
+    recent_dialog_lines: list[str] | None = None,
 ) -> str:
     """문서 선택 LLM에 전달할 사용자 프롬프트를 구성한다."""
     header = f"스레드 이름: {thread_name}\n" if str(thread_name or "").strip() else ""
     profile_lines: list[str] = []
-    for profile in document_profiles:
+    for index, profile in enumerate(document_profiles, start=1):
         document_id = str(profile.get("document_id") or "").strip()
         original_filename = str(profile.get("original_filename") or "").strip() or "-"
         compact = _render_document_profile_line(profile) or "(프로파일 없음)"
+        alias_candidates = [f"{index}번 문서"]
+        alias_candidates.extend(extract_numeric_filename_aliases(original_filename))
+        aliases = ", ".join(dict.fromkeys(alias_candidates))
         profile_lines.append(
-            f"- document_id={document_id} | filename={original_filename} | {compact}"
+            f"- document_id={document_id} | filename={original_filename} | aliases={aliases} | {compact}"
         )
     joined_profiles = "\n".join(profile_lines) if profile_lines else "- (프로파일 없음)"
+    memory_parts: list[str] = []
+    normalized_summary = str(conversation_summary or "").strip()
+    if normalized_summary:
+        memory_parts.append(f"대화 요약:\n{normalized_summary}")
+    recent_lines = [str(item).strip() for item in recent_dialog_lines or [] if str(item).strip()]
+    if recent_lines:
+        memory_parts.append("최근 대화:\n" + "\n".join(f"- {line}" for line in recent_lines))
+    joined_memory = "\n\n".join(memory_parts).strip() or "(대화 메모 없음)"
     return (
         f"{header}"
         f"사용자 질문:\n{query_text}\n\n"
+        f"대화 메모:\n{joined_memory}\n\n"
         f"후보 문서 프로파일:\n{joined_profiles}\n\n"
         "후보 문서 중 필요한 문서를 고르고, 필요하면 문서별 검색 질의를 따로 제안하세요.\n"
+        "대화 이력 기반 질문이면 conversation_memory를, 문서와 무관한 일반 질문이면 direct를 고르세요.\n"
         "단일 문서 또는 여러 문서의 설명/요약/비교처럼 프로파일만으로 답할 수 있으면 answer_strategy를 profile_only로 두세요.\n"
-        "정확한 키워드, 함수명, 클래스명, 코드 식별자, 페이지/표/그림, 절차 같은 질문은 answer_strategy를 retrieve_chunks로 두고, hybrid가 유리하면 retrieval_mode를 hybrid로 지정하세요."
+        "정확한 키워드, 함수명, 클래스명, 코드 식별자, 페이지/표/그림, 절차 같은 질문은 answer_strategy를 retrieve_chunks로 두고, hybrid가 유리하면 retrieval_mode를 hybrid로 지정하세요.\n"
+        "질문이 표/그림/페이지 같은 참조를 포함하지만 어떤 문서인지 분명하지 않으면 특정 문서로 좁히지 말고 thread_wide 검색으로 넘기세요.\n"
+        "특히 여러 문서가 연결된 상태에서 번호가 붙은 table/figure/page 참조만 있고 문서명이 없으면 추정하지 말고 thread_wide와 retrieve_chunks를 반환하세요."
+        "반대로 최근 대화에서 assistant가 문서 선택을 요청했고, 이번 사용자 발화가 문서 별칭이나 파일명만 짧게 답한 경우에는 그 답을 문서 지정으로 해석해 single_document를 선택하세요."
     )
 
 
@@ -210,7 +240,10 @@ def build_stage5_grounding_system_prompt() -> str:
         "retrieve_deeper: 현재 근거가 일부 관련되지만 부족해 추가 검색이 필요함\n"
         "clarify: 질문 대상 문서나 범위가 모호해 사용자 확인이 필요함\n"
         "근거가 질문에 직접 답하지 못하면 answer를 선택하지 마세요.\n"
+        "검색 근거가 비어 있거나, 질문과 직접 맞는 청크가 보이지 않거나, 엇나간 청크만 보이면 answer보다 clarify를 우선 고려하세요.\n"
         "clarify는 질문 범위가 모호할 때만 선택하세요.\n"
+        "여러 문서가 연결된 상태에서 표/그림/페이지/섹션 번호만 있고 문서가 특정되지 않으면 clarify를 우선 고려하세요.\n"
+        "이미 추가 검색을 한 번 더 시도했는데도 근거가 비어 있거나 부족하면 retrieve_deeper를 반복하지 말고 clarify를 우선 고려하세요.\n"
         "clarify일 때만 clarification_question을 채우고, 나머지 action에서는 null로 두세요."
     )
 
@@ -220,12 +253,20 @@ def build_stage5_grounding_user_prompt(
     query_text: str,
     answer_draft: str | None,
     context_blocks: list[str],
+    selection_type: str | None,
+    available_document_count: int,
+    selected_document_count: int,
+    deep_retrieval_attempted: bool,
 ) -> str:
     """grounding check에 사용할 사용자 프롬프트를 구성한다."""
     context_text = "\n\n".join(context_blocks).strip() or "근거 없음"
     normalized_answer_draft = answer_draft.strip() if answer_draft else "(없음)"
     return (
         f"사용자 질문:\n{query_text}\n\n"
+        f"선택 유형: {selection_type or '-'}\n"
+        f"현재 스레드 문서 수: {available_document_count}\n"
+        f"현재 검색 대상 문서 수: {selected_document_count}\n"
+        f"추가 검색 재시도 여부: {'yes' if deep_retrieval_attempted else 'no'}\n\n"
         f"현재 답변 초안:\n{normalized_answer_draft}\n\n"
         f"검색 근거:\n{context_text}\n\n"
         "위 정보를 보고 answer, retrieve_deeper, clarify 중 하나를 선택하세요."

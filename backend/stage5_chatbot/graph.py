@@ -100,7 +100,7 @@ def build_graph(
         route_after_grounding,
         ["clarify_if_needed", "fallback_or_retrieve_deeper", "compose_answer_with_citations"],
     )
-    builder.add_edge("fallback_or_retrieve_deeper", "compose_answer_with_citations")
+    builder.add_edge("fallback_or_retrieve_deeper", "grounding_check")
     builder.add_edge("compose_answer_with_citations", END)
 
     return builder.compile(checkpointer=checkpointer)
