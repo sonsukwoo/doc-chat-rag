@@ -167,6 +167,57 @@ class _FakeCrossEncoderReranker:
         return ordered
 
 
+class _TaskAwareFakeQdrantClient(_FakeQdrantClient):
+    def query_points(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        query_filter = kwargs.get("query_filter") or {}
+        document_ids: list[str] = []
+        for condition in query_filter.get("must") or []:
+            if condition.get("key") != "document_id":
+                continue
+            match = dict(condition.get("match") or {})
+            document_ids.extend(
+                str(item)
+                for item in match.get("any") or []
+                if str(item).strip()
+            )
+        document_id = document_ids[0] if document_ids else "sample"
+        return [
+            {
+                "id": f"{document_id}-a",
+                "score": 0.91,
+                "payload": {
+                    "document_id": document_id,
+                    "chunk_id": f"{document_id}-chunk-a",
+                    "parent_id": f"{document_id}-parent-a",
+                    "chunk_type": "text",
+                    "text": f"{document_id} first hit",
+                    "section_title": f"{document_id} section",
+                    "primary_page": 1,
+                    "page_start": 1,
+                    "page_end": 1,
+                    "has_asset": False,
+                },
+            },
+            {
+                "id": f"{document_id}-b",
+                "score": 0.89,
+                "payload": {
+                    "document_id": document_id,
+                    "chunk_id": f"{document_id}-chunk-b",
+                    "parent_id": f"{document_id}-parent-b",
+                    "chunk_type": "text",
+                    "text": f"{document_id} second hit",
+                    "section_title": f"{document_id} section",
+                    "primary_page": 2,
+                    "page_start": 2,
+                    "page_end": 2,
+                    "has_asset": False,
+                },
+            },
+        ]
+
+
 class Stage4RetrievalTests(unittest.TestCase):
     def test_qdrant_chunk_retriever_returns_langchain_documents(self):
         fake_qdrant = _FakeQdrantClient()
@@ -731,20 +782,59 @@ class Stage4RetrievalTests(unittest.TestCase):
             },
             query_filters,
         )
-        self.assertIn(
-            {
-                "must": [
+
+    def test_search_thread_knowledge_applies_task_level_rerank_for_multi_task_queries(self):
+        fake_qdrant = _TaskAwareFakeQdrantClient()
+
+        def _fake_rerank(*, query, documents, enabled, model_name, top_n, device):
+            if not enabled:
+                return documents, False, None
+            ordered = list(reversed(documents))
+            return ordered[:top_n], True, None
+
+        with patch(
+            "backend.stage4_retrieval.service.apply_cross_encoder_reranking",
+            side_effect=_fake_rerank,
+        ):
+            result = search_thread_knowledge(
+                query="멀티 태스크 질문",
+                thread_id="thread-alpha",
+                active_document_ids=["doc-1", "doc-2"],
+                retrieval_tasks=[
                     {
-                        "key": "thread_id",
-                        "match": {"value": "thread-alpha"},
+                        "task_id": "task-1",
+                        "subquery": "doc-1 질문",
+                        "document_ids": ["doc-1"],
                     },
                     {
-                        "key": "document_id",
-                        "match": {"any": ["doc-3"]},
+                        "task_id": "task-2",
+                        "subquery": "doc-2 질문",
+                        "document_ids": ["doc-2"],
                     },
-                ]
-            },
-            query_filters,
+                ],
+                collection_name="rag_chat_hybrid",
+                retrieval_mode="dense",
+                top_k=8,
+                use_per_document_search=True,
+                embedding_client=_FakeEmbeddingClient(),
+                qdrant_client=fake_qdrant,
+                enable_rerank=True,
+                enable_mmr=False,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["task_search_used"])
+        self.assertFalse(result["per_document_search_used"])
+        self.assertTrue(result["rerank_applied"])
+        self.assertEqual(result["retrieved_count"], 4)
+        self.assertEqual(
+            [item["chunk_id"] for item in result["retrievals"]],
+            [
+                "doc-1-chunk-b",
+                "doc-2-chunk-b",
+                "doc-1-chunk-a",
+                "doc-2-chunk-a",
+            ],
         )
 
     def test_run_stage4_retrieval_applies_mmr_and_parent_window_context(self):

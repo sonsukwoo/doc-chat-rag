@@ -7,6 +7,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel
 
+from backend.stage5_chatbot.document_selection import extract_explicit_document_ids
 from backend.stage5_chatbot.graph import build_graph
 from backend.stage5_chatbot.nodes import (
     _get_latest_user_text,
@@ -84,6 +85,12 @@ class _FakeToolCallingModel:
         if configured_response is None and schema_name == "GroundingDecisionResult":
             response_key = "GroundingCheckResult"
             configured_response = self._structured_responses.get(response_key)
+        if configured_response is None and schema_name == "IntentClassificationResult":
+            configured_response = {
+                "answer_strategy": "retrieve_chunks",
+                "memory_mode": "none",
+                "reason": "default test intent classification",
+            }
         if configured_response is None:
             raise AssertionError(
                 f"structured response was not configured for {schema_name}"
@@ -156,6 +163,38 @@ def _normalize_grounding_decision_response(
 
 
 class Stage5ChatbotTests(unittest.TestCase):
+    def test_explicit_document_selection_matches_partial_title_phrases(self):
+        profiles = [
+            {
+                "document_id": "doc-5",
+                "original_filename": "5.pdf",
+                "title": "AI 활용법과 프로그래밍 교육에 대한 경험과 인사이트",
+                "document_type": "개발자 블로그 글",
+            },
+            {
+                "document_id": "doc-1",
+                "original_filename": "1.pdf",
+                "title": "피부 질환의 주 분류를 위한 설명 가능한 멀티모달 비전-언어 모델과 DBSCAN 중심 신뢰도 점수 기반 방법",
+                "document_type": "학술 논문",
+            },
+            {
+                "document_id": "doc-3",
+                "original_filename": "3.pdf",
+                "title": "2025학년도 1학기 졸업논문(작품, 연주, 시험) 실시계획",
+                "document_type": "졸업논문 및 시험 실시계획서",
+            },
+        ]
+
+        self.assertEqual(
+            extract_explicit_document_ids(
+                "AI 활용법과 프로그래밍 교육에 대한 경험과 인사이트에서는 자동완성을 어디까지 말하는지, "
+                "피부 질환 논문에서는 파인튜닝 후 가장 성능 좋은 모델이 무엇인지, "
+                "졸업논문 실시계획에서는 제출 절차를 각각 설명해줘",
+                profiles,
+            ),
+            ["doc-5", "doc-1", "doc-3"],
+        )
+
     def test_resolve_active_interrupt_ignores_stale_interrupts(self):
         interrupt = _resolve_active_interrupt(
             {
@@ -166,19 +205,69 @@ class Stage5ChatbotTests(unittest.TestCase):
         )
         self.assertIsNone(interrupt)
 
-    def test_clarification_resume_uses_combined_query_text(self):
-        combined_query = "Figure 4 설명 좀 해줘\n\n추가 정보:\n1번문서"
-        resolved_query = _get_latest_user_text(
-            {
-                "user_message": combined_query,
-                "clarification_response": "1번문서",
-                "messages": [
-                    HumanMessage(content="Figure 4 설명 좀 해줘"),
-                    HumanMessage(content="1번문서"),
-                ],
-            }
-        )
-        self.assertEqual(resolved_query, combined_query)
+    def test_clarification_resume_keeps_original_query_when_document_alias_is_given(self):
+        with unittest.mock.patch(
+            "backend.stage5_chatbot.nodes.interrupt",
+            return_value="1.pdf야",
+        ):
+            updates = clarify_if_needed(
+                {
+                    "user_message": "Figure 4 설명 좀 해줘",
+                    "messages": [HumanMessage(content="Figure 4 설명 좀 해줘")],
+                    "query_analysis": {
+                        "clarification_question": "어느 문서의 Figure 4인지 알려주세요?",
+                        "reason": "문서 범위를 먼저 확정해야 합니다.",
+                    },
+                    "active_document_ids": ["doc-1", "doc-2"],
+                    "document_profiles": [
+                        {
+                            "document_id": "doc-1",
+                            "original_filename": "1.pdf",
+                            "title": "피부 질환 논문",
+                        },
+                        {
+                            "document_id": "doc-2",
+                            "original_filename": "2.pdf",
+                            "title": "랭체인 가이드",
+                        },
+                    ],
+                }
+            )
+
+        self.assertEqual(updates["retrieval_document_ids"], ["doc-1"])
+        self.assertEqual(updates["user_message"], "Figure 4 설명 좀 해줘")
+
+    def test_clarification_resume_treats_non_document_reply_as_new_question(self):
+        with unittest.mock.patch(
+            "backend.stage5_chatbot.nodes.interrupt",
+            return_value="안녕",
+        ):
+            updates = clarify_if_needed(
+                {
+                    "user_message": "Figure 4 설명 좀 해줘",
+                    "messages": [HumanMessage(content="Figure 4 설명 좀 해줘")],
+                    "query_analysis": {
+                        "clarification_question": "어느 문서의 Figure 4인지 알려주세요?",
+                        "reason": "문서 범위를 먼저 확정해야 합니다.",
+                    },
+                    "active_document_ids": ["doc-1", "doc-2"],
+                    "document_profiles": [
+                        {
+                            "document_id": "doc-1",
+                            "original_filename": "1.pdf",
+                            "title": "피부 질환 논문",
+                        },
+                        {
+                            "document_id": "doc-2",
+                            "original_filename": "2.pdf",
+                            "title": "랭체인 가이드",
+                        },
+                    ],
+                }
+            )
+
+        self.assertEqual(updates["retrieval_document_ids"], ["doc-1", "doc-2"])
+        self.assertEqual(updates["user_message"], "안녕")
 
     def test_load_request_context_persists_unresolved_interrupt_before_new_question(self):
         updates = load_request_context(
@@ -357,7 +446,7 @@ class Stage5ChatbotTests(unittest.TestCase):
                         {
                             "name": "search_thread_knowledge",
                             "args": {
-                                "query": "3번 문서 기준으로 랭체인 create_agent 인자 알려줘"
+                                "query": "BM25 검색 문서 기준으로 랭체인 create_agent 인자 알려줘"
                             },
                             "id": "tool-call-1",
                             "type": "tool_call",
@@ -391,7 +480,7 @@ class Stage5ChatbotTests(unittest.TestCase):
         result = run_stage5_chatbot(
             {
                 "thread_id": "thread-multi-doc",
-                "user_message": "3번 문서 기준으로 랭체인 create_agent 인자 알려줘",
+                "user_message": "BM25 검색 문서 기준으로 랭체인 create_agent 인자 알려줘",
                 "active_document_ids": ["doc-2", "doc-3"],
                 "document_profiles": [
                     {
@@ -573,27 +662,47 @@ class Stage5ChatbotTests(unittest.TestCase):
         self.assertEqual(result["retrieval_mode"], "hybrid")
         self.assertEqual(result["citations"][0]["document_id"], "doc-2")
 
-    def test_explicit_multi_document_summary_uses_profile_only_answer(self):
+    def test_explicit_multi_document_summary_uses_retrieval_route(self):
         stage4_runner = _CapturingStage4Runner()
         fake_llm = _FakeToolCallingModel(
             [
                 AIMessage(
-                    content="1번 문서는 피부 질환 논문이고 2번 문서는 랭체인 가이드입니다."
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "search_thread_knowledge",
+                            "args": {"query": "1번 문서와 2번 문서 설명해줘"},
+                            "id": "tool-call-1",
+                            "type": "tool_call",
+                        }
+                    ],
                 ),
+                AIMessage(content="검색 완료"),
             ],
             structured_responses={
                 "DocumentSelectionResult": {
                     "query_type": "multi_document",
                     "selected_document_ids": ["doc-1", "doc-2"],
-                    "per_document_queries": {},
-                    "answer_strategy": "profile_only",
+                    "retrieval_tasks": [
+                        {
+                            "task_id": "task-1",
+                            "subquery": "1번 문서와 2번 문서 설명해줘",
+                            "document_ids": ["doc-1"],
+                        },
+                        {
+                            "task_id": "task-2",
+                            "subquery": "1번 문서와 2번 문서 설명해줘",
+                            "document_ids": ["doc-2"],
+                        },
+                    ],
+                    "answer_strategy": "retrieve_chunks",
                 },
                 "GroundingDecisionResult": {
                     "action": "answer",
                     "clarification_question": None,
                 },
                 "FinalAnswerResult": {
-                    "answer": "unused",
+                    "answer": "1번 문서와 2번 문서를 검색 근거로 설명했습니다.",
                     "grounded": True,
                 },
             },
@@ -625,32 +734,47 @@ class Stage5ChatbotTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(stage4_runner.calls, [])
-        self.assertEqual(result["debug_trace"]["answer_strategy"], "profile_only")
-        self.assertEqual(result["debug_trace"]["tool_calls"], [])
-        self.assertIn("1번 문서는 피부 질환 논문", str(result["final_answer"]))
+        self.assertEqual(len(stage4_runner.calls), 1)
+        self.assertEqual(result["debug_trace"]["answer_strategy"], "retrieve_chunks")
+        self.assertEqual(result["debug_trace"]["tool_calls"][0]["name"], "search_thread_knowledge")
+        self.assertIn("검색 근거", str(result["final_answer"]))
 
-    def test_single_document_summary_uses_profile_only_answer_from_llm(self):
+    def test_single_document_summary_uses_retrieval_route(self):
         stage4_runner = _CapturingStage4Runner()
         fake_llm = _FakeToolCallingModel(
             [
                 AIMessage(
-                    content="1번 문서는 피부 질환 분류용 멀티모달 VLM 연구를 다루는 논문입니다."
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "search_thread_knowledge",
+                            "args": {"query": "1번 문서 설명"},
+                            "id": "tool-call-1",
+                            "type": "tool_call",
+                        }
+                    ],
                 ),
+                AIMessage(content="검색 완료"),
             ],
             structured_responses={
                 "DocumentSelectionResult": {
                     "query_type": "single_document",
                     "selected_document_ids": ["doc-1"],
-                    "per_document_queries": {},
-                    "answer_strategy": "profile_only",
+                    "retrieval_tasks": [
+                        {
+                            "task_id": "task-1",
+                            "subquery": "1번 문서 설명",
+                            "document_ids": ["doc-1"],
+                        }
+                    ],
+                    "answer_strategy": "retrieve_chunks",
                 },
                 "GroundingDecisionResult": {
                     "action": "answer",
                     "clarification_question": None,
                 },
                 "FinalAnswerResult": {
-                    "answer": "unused",
+                    "answer": "1번 문서는 검색 근거 기준으로 설명했습니다.",
                     "grounded": True,
                 },
             },
@@ -687,12 +811,98 @@ class Stage5ChatbotTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(stage4_runner.calls, [])
+        self.assertEqual(len(stage4_runner.calls), 1)
         self.assertEqual(result["debug_trace"]["selection_source"], "llm")
-        self.assertEqual(result["debug_trace"]["answer_strategy"], "profile_only")
+        self.assertEqual(result["debug_trace"]["answer_strategy"], "retrieve_chunks")
         self.assertEqual(result["debug_trace"]["selected_document_ids"], ["doc-1"])
 
-    def test_explicit_document_tool_queries_are_scoped_to_each_document(self):
+    def test_document_summary_uses_overview_route_without_vector_search(self):
+        stage4_runner = _CapturingStage4Runner()
+
+        def overview_loader(**kwargs):
+            return [
+                {
+                    "point_id": "overview:doc-1:parent-1",
+                    "document_id": "doc-1",
+                    "chunk_id": "overview-1",
+                    "parent_id": "parent-1",
+                    "score": 1.0,
+                    "chunk_type": "overview",
+                    "text": "문서 대표 본문입니다. 전체 주제와 핵심 내용을 요약할 수 있습니다.",
+                    "section_title": "개요",
+                    "primary_page": 1,
+                    "page_start": 1,
+                    "page_end": 1,
+                    "has_asset": False,
+                    "context_text": "문서 대표 본문입니다. 전체 주제와 핵심 내용을 요약할 수 있습니다.",
+                    "context_chunk_ids": [],
+                    "expansion_mode": "document_overview",
+                }
+            ]
+
+        fake_llm = _FakeToolCallingModel(
+            [],
+            structured_responses={
+                "DocumentSelectionResult": {
+                    "query_type": "single_document",
+                    "selected_document_ids": ["doc-1"],
+                    "retrieval_tasks": [
+                        {
+                            "task_id": "task-1",
+                            "subquery": "피부 질환 논문 요약",
+                            "user_question": "피부 질환 논문 요약",
+                            "task_type": "document_summary",
+                            "retrieval_strategy": "document_overview",
+                            "document_ids": ["doc-1"],
+                        }
+                    ],
+                    "answer_strategy": "retrieve_chunks",
+                },
+                "GroundingDecisionResult": {
+                    "action": "answer",
+                    "clarification_question": None,
+                },
+                "FinalAnswerResult": {
+                    "answer": "문서 대표 본문 기준 요약입니다.",
+                    "grounded": True,
+                },
+            },
+        )
+
+        result = run_stage5_chatbot(
+            {
+                "thread_id": "thread-overview-summary",
+                "user_message": "피부 질환 논문 요약",
+                "active_document_ids": ["doc-1", "doc-2"],
+                "document_profiles": [
+                    {
+                        "document_id": "doc-1",
+                        "original_filename": "skin-paper.pdf",
+                        "title": "피부 질환 논문",
+                        "main_topics": ["피부 질환 분류"],
+                    },
+                    {
+                        "document_id": "doc-2",
+                        "original_filename": "agent-guide.pdf",
+                        "title": "AI 에이전트 가이드",
+                        "main_topics": ["랭체인"],
+                    }
+                ],
+                "_overview_loader": overview_loader,
+            },
+            checkpointer=InMemorySaver(),
+            llm=fake_llm,
+            stage4_runner=stage4_runner,
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(stage4_runner.calls, [])
+        self.assertEqual(result["retrieval_mode"], "overview")
+        self.assertEqual(result["evidence_chunks"][0]["chunk_type"], "overview")
+        self.assertTrue(result["debug_trace"]["tool_calls"][0]["overview_search_used"])
+        self.assertFalse(result["debug_trace"]["tool_calls"][0]["rerank_requested"])
+
+    def test_explicit_document_tasks_are_scoped_to_each_document(self):
         stage4_runner = _CapturingStage4Runner()
         fake_llm = _FakeToolCallingModel(
             [
@@ -743,7 +953,10 @@ class Stage5ChatbotTests(unittest.TestCase):
         result = run_stage5_chatbot(
             {
                 "thread_id": "thread-explicit-tool-scoping",
-                "user_message": "1번 2번 3번 문서의 근거와 페이지를 각각 설명해줘",
+                "user_message": (
+                    "피부 질환 논문, 랭체인 가이드, 졸업논문 제출 절차의 "
+                    "근거와 페이지를 각각 설명해줘"
+                ),
                 "active_document_ids": ["doc-1", "doc-2", "doc-3"],
                 "document_profiles": [
                     {
@@ -772,24 +985,43 @@ class Stage5ChatbotTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(stage4_runner.calls), 1)
         self.assertEqual(
-            [call["active_document_ids"] for call in stage4_runner.calls],
-            [["doc-1"], ["doc-2"], ["doc-3"]],
+            stage4_runner.calls[0]["active_document_ids"],
+            ["doc-1", "doc-2", "doc-3"],
         )
+        self.assertTrue(stage4_runner.calls[0]["use_per_document_search"])
         self.assertEqual(
-            [call["use_per_document_search"] for call in stage4_runner.calls],
-            [False, False, False],
-        )
-        self.assertEqual(
-            [call["query"] for call in stage4_runner.calls],
+            stage4_runner.calls[0]["retrieval_tasks"],
             [
-                "1번 문서 근거와 페이지를 설명",
-                "2번 문서 근거와 페이지를 설명",
-                "3번 문서 근거와 페이지를 설명",
+                {
+                    "task_id": "task-1",
+                    "subquery": (
+                        "피부 질환 논문, 랭체인 가이드, 졸업논문 제출 절차의 "
+                        "근거와 페이지를 각각 설명해줘"
+                    ),
+                    "document_ids": ["doc-1"],
+                },
+                {
+                    "task_id": "task-2",
+                    "subquery": (
+                        "피부 질환 논문, 랭체인 가이드, 졸업논문 제출 절차의 "
+                        "근거와 페이지를 각각 설명해줘"
+                    ),
+                    "document_ids": ["doc-2"],
+                },
+                {
+                    "task_id": "task-3",
+                    "subquery": (
+                        "피부 질환 논문, 랭체인 가이드, 졸업논문 제출 절차의 "
+                        "근거와 페이지를 각각 설명해줘"
+                    ),
+                    "document_ids": ["doc-3"],
+                },
             ],
         )
 
-    def test_llm_multi_document_selection_passes_per_document_queries(self):
+    def test_llm_multi_document_selection_passes_retrieval_tasks(self):
         stage4_runner = _CapturingStage4Runner()
         fake_llm = _FakeToolCallingModel(
             [
@@ -798,7 +1030,7 @@ class Stage5ChatbotTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "search_thread_knowledge",
-                            "args": {"query": "두 문서 핵심 차이를 정리해줘"},
+                            "args": {"query": "랭체인 메모리와 졸업논문 제출 차이를 정리해줘"},
                             "id": "tool-call-1",
                             "type": "tool_call",
                         }
@@ -810,10 +1042,18 @@ class Stage5ChatbotTests(unittest.TestCase):
                 "DocumentSelectionResult": {
                     "query_type": "comparison",
                     "selected_document_ids": ["doc-2", "doc-3"],
-                    "per_document_queries": {
-                        "doc-2": "2번 문서 핵심 요약",
-                        "doc-3": "3번 문서 핵심 요약",
-                    },
+                    "retrieval_tasks": [
+                        {
+                            "task_id": "task-1",
+                            "subquery": "랭체인 메모리 핵심 요약",
+                            "document_ids": ["doc-2"],
+                        },
+                        {
+                            "task_id": "task-2",
+                            "subquery": "졸업논문 제출 핵심 요약",
+                            "document_ids": ["doc-3"],
+                        },
+                    ],
                     "retrieval_mode": "hybrid",
                     "answer_strategy": "retrieve_chunks",
                 },
@@ -831,7 +1071,7 @@ class Stage5ChatbotTests(unittest.TestCase):
         result = run_stage5_chatbot(
             {
                 "thread_id": "thread-multi-doc",
-                "user_message": "두 문서의 근거와 세부 차이를 정리해줘",
+                "user_message": "랭체인 메모리와 졸업논문 제출 차이를 정리해줘",
                 "active_document_ids": ["doc-2", "doc-3"],
                 "document_profiles": [
                     {
@@ -867,16 +1107,126 @@ class Stage5ChatbotTests(unittest.TestCase):
         self.assertEqual(
             stage4_runner.calls[0]["document_queries"],
             {
-                "doc-2": "2번 문서 핵심 요약",
-                "doc-3": "3번 문서 핵심 요약",
+                "doc-2": "랭체인 메모리 핵심 요약",
+                "doc-3": "졸업논문 제출 핵심 요약",
             },
+        )
+        self.assertEqual(
+            stage4_runner.calls[0]["retrieval_tasks"],
+            [
+                {
+                    "task_id": "task-1",
+                    "subquery": "랭체인 메모리 핵심 요약",
+                    "document_ids": ["doc-2"],
+                },
+                {
+                    "task_id": "task-2",
+                    "subquery": "졸업논문 제출 핵심 요약",
+                    "document_ids": ["doc-3"],
+                },
+            ],
         )
         search_trace = result["debug_trace"]["tool_calls"][0]
         self.assertTrue(search_trace["per_document_search_used"])
         self.assertTrue(search_trace["rerank_requested"])
         self.assertEqual(search_trace["retrieval_mode"], "hybrid")
 
-    def test_multi_document_selection_without_queries_builds_profile_anchored_queries(self):
+    def test_multi_task_without_explicit_document_reference_widens_task_scope(self):
+        stage4_runner = _CapturingStage4Runner()
+        fake_llm = _FakeToolCallingModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "search_thread_knowledge",
+                            "args": {"query": "자동완성 부분이 어디까지인지 설명하고 졸업논문 제출 절차도 설명해줘"},
+                            "id": "tool-call-1",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="검색 완료"),
+            ],
+            structured_responses={
+                "DocumentSelectionResult": {
+                    "query_type": "multi_document",
+                    "selected_document_ids": ["doc-2", "doc-3"],
+                    "retrieval_tasks": [
+                        {
+                            "task_id": "task-1",
+                            "subquery": "자동완성 부분이 어디까지인지 설명",
+                            "document_ids": ["doc-2"],
+                        },
+                        {
+                            "task_id": "task-2",
+                            "subquery": "졸업논문 제출 절차 설명",
+                            "document_ids": ["doc-3"],
+                        },
+                    ],
+                    "retrieval_mode": "hybrid",
+                    "answer_strategy": "retrieve_chunks",
+                },
+                "GroundingDecisionResult": {
+                    "action": "answer",
+                    "clarification_question": None,
+                },
+                "FinalAnswerResult": {
+                    "answer": "자동완성과 졸업논문 절차 설명입니다.",
+                    "grounded": True,
+                },
+            },
+        )
+
+        result = run_stage5_chatbot(
+            {
+                "thread_id": "thread-thread-wide-multi-task",
+                "user_message": "자동완성 부분이 어디까지인지 설명하고 졸업논문 제출 절차도 설명해줘",
+                "active_document_ids": ["doc-2", "doc-3"],
+                "document_profiles": [
+                    {
+                        "document_id": "doc-2",
+                        "original_filename": "2.pdf",
+                        "title": "에이전트 개발 가이드",
+                        "document_type": "기술 문서",
+                        "main_topics": ["create_agent", "구조화 출력"],
+                        "short_summary": "랭체인 실무 가이드",
+                    },
+                    {
+                        "document_id": "doc-3",
+                        "original_filename": "3.pdf",
+                        "title": "학사 제출 안내",
+                        "document_type": "행정 문서",
+                        "main_topics": ["계획서 제출", "승인 절차"],
+                        "short_summary": "졸업논문 제출 문서",
+                    },
+                ],
+            },
+            checkpointer=InMemorySaver(),
+            llm=fake_llm,
+            stage4_runner=stage4_runner,
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(stage4_runner.calls[0]["active_document_ids"], ["doc-2", "doc-3"])
+        self.assertTrue(stage4_runner.calls[0]["use_per_document_search"])
+        self.assertEqual(
+            stage4_runner.calls[0]["retrieval_tasks"],
+            [
+                {
+                    "task_id": "task-1",
+                    "subquery": "자동완성 부분이 어디까지인지 설명하고 졸업논문 제출 절차도 설명해줘",
+                    "document_ids": ["doc-2"],
+                },
+                {
+                    "task_id": "task-2",
+                    "subquery": "자동완성 부분이 어디까지인지 설명하고 졸업논문 제출 절차도 설명해줘",
+                    "document_ids": ["doc-3"],
+                },
+            ],
+        )
+
+    def test_multi_document_selection_without_queries_builds_raw_query_tasks(self):
         stage4_runner = _CapturingStage4Runner()
         fake_llm = _FakeToolCallingModel(
             [
@@ -949,10 +1299,30 @@ class Stage5ChatbotTests(unittest.TestCase):
         self.assertEqual(
             stage4_runner.calls[0]["document_queries"],
             {
-                "doc-1": "1번 2번 3번 문서의 근거를 각각 설명해줘 피부 질환 논문 질환 분류",
-                "doc-2": "1번 2번 3번 문서의 근거를 각각 설명해줘 랭체인 가이드 create_agent",
-                "doc-3": "1번 2번 3번 문서의 근거를 각각 설명해줘 졸업논문 절차 계획서 제출",
+                "doc-1": "1번 2번 3번 문서의 근거를 각각 설명해줘",
+                "doc-2": "1번 2번 3번 문서의 근거를 각각 설명해줘",
+                "doc-3": "1번 2번 3번 문서의 근거를 각각 설명해줘",
             },
+        )
+        self.assertEqual(
+            stage4_runner.calls[0]["retrieval_tasks"],
+            [
+                {
+                    "task_id": "task-1",
+                    "subquery": "1번 2번 3번 문서의 근거를 각각 설명해줘",
+                    "document_ids": ["doc-1"],
+                },
+                {
+                    "task_id": "task-2",
+                    "subquery": "1번 2번 3번 문서의 근거를 각각 설명해줘",
+                    "document_ids": ["doc-2"],
+                },
+                {
+                    "task_id": "task-3",
+                    "subquery": "1번 2번 3번 문서의 근거를 각각 설명해줘",
+                    "document_ids": ["doc-3"],
+                },
+            ],
         )
 
     def test_single_document_selection_without_queries_keeps_raw_query(self):
@@ -1027,8 +1397,34 @@ class Stage5ChatbotTests(unittest.TestCase):
             stage4_runner.calls[0]["query"],
             "랭체인에서 create_agent 사용법",
         )
-        self.assertEqual(stage4_runner.calls[0]["document_queries"], {})
-        self.assertEqual(result["debug_trace"]["selected_document_queries"], {})
+        self.assertEqual(
+            stage4_runner.calls[0]["document_queries"],
+            {"doc-2": "랭체인에서 create_agent 사용법"},
+        )
+        self.assertEqual(
+            stage4_runner.calls[0]["retrieval_tasks"],
+            [
+                {
+                    "task_id": "task-1",
+                    "subquery": "랭체인에서 create_agent 사용법",
+                    "document_ids": ["doc-2"],
+                }
+            ],
+        )
+        self.assertEqual(
+            result["debug_trace"]["selected_document_queries"],
+            {"doc-2": "랭체인에서 create_agent 사용법"},
+        )
+        self.assertEqual(
+            result["debug_trace"]["retrieval_tasks"],
+            [
+                {
+                    "task_id": "task-1",
+                    "subquery": "랭체인에서 create_agent 사용법",
+                    "document_ids": ["doc-2"],
+                }
+            ],
+        )
 
     def test_insufficient_answer_draft_forces_deterministic_deeper_retrieval(self):
         stage4_runner = _CapturingStage4Runner()
@@ -1052,10 +1448,16 @@ class Stage5ChatbotTests(unittest.TestCase):
                 ),
             ],
             structured_responses={
-                "GroundingDecisionResult": {
-                    "action": "answer",
-                    "clarification_question": None,
-                },
+                "GroundingDecisionResult": [
+                    {
+                        "action": "retrieve_deeper",
+                        "clarification_question": None,
+                    },
+                    {
+                        "action": "answer",
+                        "clarification_question": None,
+                    },
+                ],
                 "FinalAnswerResult": {
                     "answer": "심화 검색 후 답변입니다.",
                     "grounded": True,
@@ -1089,7 +1491,7 @@ class Stage5ChatbotTests(unittest.TestCase):
             "1번 논문에서 예시 질환 사진으로 나온 질환",
         )
         self.assertIn(
-            "grounding_check:retrieve_deeper:deterministic",
+            "grounding_check:retrieve_deeper:llm",
             result["debug_trace"]["logs"],
         )
 
@@ -1365,6 +1767,136 @@ class Stage5ChatbotTests(unittest.TestCase):
         self.assertEqual(len(stage4_runner.calls), 2)
         self.assertEqual(stage4_runner.calls[-1]["active_document_ids"], ["doc-2"])
 
+    def test_summary_retrieval_persists_document_scope_for_followup_retrieval(self):
+        checkpointer = InMemorySaver()
+        stage4_runner = _CapturingStage4Runner()
+
+        first_llm = _FakeToolCallingModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "search_thread_knowledge",
+                            "args": {"query": "피부 질환 논문 요약해줘"},
+                            "id": "tool-call-summary",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="1번 문서는 피부 질환 분류 논문입니다."),
+            ],
+            structured_responses={
+                "IntentClassificationResult": {
+                    "answer_strategy": "retrieve_chunks",
+                    "memory_mode": "none",
+                    "reason": "요약도 문서 근거 검색이 필요한 질문입니다.",
+                },
+                "DocumentSelectionResult": {
+                    "query_type": "single_document",
+                    "selected_document_ids": ["doc-1"],
+                    "retrieval_tasks": [
+                        {
+                            "task_id": "task-1",
+                            "subquery": "피부 질환 논문 요약해줘",
+                            "document_ids": ["doc-1"],
+                        }
+                    ],
+                    "answer_strategy": "retrieve_chunks",
+                },
+                "GroundingDecisionResult": {
+                    "action": "answer",
+                    "clarification_question": None,
+                },
+                "FinalAnswerResult": {
+                    "answer": "unused",
+                    "grounded": True,
+                },
+            },
+        )
+        second_llm = _FakeToolCallingModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "search_thread_knowledge",
+                            "args": {"query": "Figure 4 설명해줘"},
+                            "id": "tool-call-followup",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="Figure 4는 피부 병변 예시를 보여줍니다."),
+            ],
+            structured_responses={
+                "IntentClassificationResult": {
+                    "answer_strategy": "retrieve_chunks",
+                    "memory_mode": "resolve_for_retrieval",
+                    "reason": "직전 문서 범위를 이어받아 다시 검색해야 하는 질문입니다.",
+                },
+                "GroundingDecisionResult": {
+                    "action": "answer",
+                    "clarification_question": None,
+                },
+                "FinalAnswerResult": {
+                    "answer": "Figure 4는 피부 병변 예시를 보여줍니다.",
+                    "grounded": True,
+                },
+            },
+        )
+
+        first_turn = run_stage5_chatbot(
+            {
+                "thread_id": "thread-profile-followup",
+                "user_message": "피부 질환 논문 요약해줘",
+                "active_document_ids": ["doc-1", "doc-2"],
+                "document_profiles": [
+                    {
+                        "document_id": "doc-1",
+                        "original_filename": "1.pdf",
+                        "title": "피부 질환 논문",
+                    },
+                    {
+                        "document_id": "doc-2",
+                        "original_filename": "2.pdf",
+                        "title": "랭체인 가이드",
+                    },
+                ],
+            },
+            checkpointer=checkpointer,
+            llm=first_llm,
+            stage4_runner=stage4_runner,
+        )
+        second_turn = run_stage5_chatbot(
+            {
+                "thread_id": "thread-profile-followup",
+                "user_message": "Figure 4 설명해줘",
+                "active_document_ids": ["doc-1", "doc-2"],
+                "document_profiles": [
+                    {
+                        "document_id": "doc-1",
+                        "original_filename": "1.pdf",
+                        "title": "피부 질환 논문",
+                    },
+                    {
+                        "document_id": "doc-2",
+                        "original_filename": "2.pdf",
+                        "title": "랭체인 가이드",
+                    },
+                ],
+            },
+            checkpointer=checkpointer,
+            llm=second_llm,
+            stage4_runner=stage4_runner,
+        )
+
+        self.assertEqual(first_turn["status"], "completed")
+        self.assertEqual(second_turn["status"], "completed")
+        self.assertEqual(len(stage4_runner.calls), 2)
+        self.assertEqual(stage4_runner.calls[0]["active_document_ids"], ["doc-1"])
+        self.assertEqual(stage4_runner.calls[1]["active_document_ids"], ["doc-1"])
+
     def test_deeper_retrieval_keeps_mode_and_expands_multi_document_candidates(self):
         stage4_runner = _CapturingStage4Runner()
         fake_llm = _FakeToolCallingModel(
@@ -1376,11 +1908,23 @@ class Stage5ChatbotTests(unittest.TestCase):
                 "DocumentSelectionResult": {
                     "query_type": "comparison",
                     "selected_document_ids": ["doc-1", "doc-2", "doc-3"],
-                    "per_document_queries": {
-                        "doc-1": "1번 문서 설명",
-                        "doc-2": "2번 문서 설명",
-                        "doc-3": "3번 문서 설명",
-                    },
+                    "retrieval_tasks": [
+                        {
+                            "task_id": "task-1",
+                            "subquery": "1번 문서 설명",
+                            "document_ids": ["doc-1"],
+                        },
+                        {
+                            "task_id": "task-2",
+                            "subquery": "2번 문서 설명",
+                            "document_ids": ["doc-2"],
+                        },
+                        {
+                            "task_id": "task-3",
+                            "subquery": "3번 문서 설명",
+                            "document_ids": ["doc-3"],
+                        },
+                    ],
                     "retrieval_mode": "dense",
                     "answer_strategy": "retrieve_chunks",
                 },

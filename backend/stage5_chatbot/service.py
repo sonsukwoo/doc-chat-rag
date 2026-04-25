@@ -7,6 +7,7 @@ from typing import Any
 from langgraph.types import Command
 
 from backend.app_db import (
+    load_document_overview_chunks,
     load_expanded_context_blocks,
     load_visual_assets,
     try_load_thread_runtime_context,
@@ -109,6 +110,7 @@ def run_stage5_chatbot(
     context_window_loader = (
         inputs.get("_context_window_loader") or load_expanded_context_blocks
     )
+    overview_loader = inputs.get("_overview_loader") or load_document_overview_chunks
     visual_asset_loader = inputs.get("_visual_asset_loader") or load_visual_assets
 
     tools = build_stage5_tools(
@@ -119,6 +121,7 @@ def run_stage5_chatbot(
                 query=kwargs["query"],
                 thread_id=kwargs.get("thread_id"),
                 active_document_ids=kwargs.get("active_document_ids"),
+                retrieval_tasks=kwargs.get("retrieval_tasks"),
                 document_queries=kwargs.get("document_queries"),
                 collection_name=kwargs.get("collection_name"),
                 retrieval_mode=kwargs.get("retrieval_mode"),
@@ -169,6 +172,7 @@ def run_stage5_chatbot(
             llm=llm or get_agent_model(),
             retrieval_runner=stage4_runner or search_thread_knowledge,
             context_window_loader=context_window_loader,
+            overview_loader=overview_loader,
         )
         result = graph.invoke(graph_command, config=config)
     else:
@@ -179,6 +183,7 @@ def run_stage5_chatbot(
                 llm=llm or get_agent_model(),
                 retrieval_runner=stage4_runner or search_thread_knowledge,
                 context_window_loader=context_window_loader,
+                overview_loader=overview_loader,
             )
             result = graph.invoke(graph_command, config=config)
 

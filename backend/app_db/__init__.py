@@ -19,9 +19,11 @@ from .repositories import (
 )
 from .services import (
     DocumentRuntimeProfilePayload,
+    DocumentOverviewHitPayload,
     ExpandedContextBlockPayload,
     ThreadRuntimeContext,
     VisualAssetPayload,
+    load_document_overview_chunks,
     load_expanded_context_blocks,
     load_thread_runtime_context,
     load_visual_assets,
@@ -45,9 +47,11 @@ __all__ = [
     "CheckpointRepository",
     "DocumentRepository",
     "DocumentRuntimeProfilePayload",
+    "DocumentOverviewHitPayload",
     "ExpandedContextBlockPayload",
     "ThreadRuntimeContext",
     "VisualAssetPayload",
+    "load_document_overview_chunks",
     "load_expanded_context_blocks",
     "load_thread_runtime_context",
     "load_visual_assets",

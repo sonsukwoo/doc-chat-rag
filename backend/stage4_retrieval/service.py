@@ -311,11 +311,130 @@ def _apply_global_postprocess_to_hits(
     }
 
 
+def _normalize_retrieval_tasks_input(
+    *,
+    retrieval_tasks: list[dict[str, Any]] | None,
+    fallback_document_ids: list[str],
+) -> list[dict[str, Any]]:
+    normalized_fallback_document_ids = [
+        str(document_id).strip()
+        for document_id in fallback_document_ids
+        if str(document_id).strip()
+    ]
+    allowed_document_ids = set(normalized_fallback_document_ids)
+    normalized_tasks: list[dict[str, Any]] = []
+
+    for index, task in enumerate(retrieval_tasks or [], start=1):
+        raw_task = dict(task or {})
+        subquery = str(raw_task.get("subquery") or "").strip()
+        if not subquery:
+            continue
+        document_ids = [
+            str(document_id).strip()
+            for document_id in raw_task.get("document_ids") or []
+            if str(document_id).strip()
+            and (
+                not allowed_document_ids
+                or str(document_id).strip() in allowed_document_ids
+            )
+        ]
+        if not document_ids:
+            document_ids = list(normalized_fallback_document_ids)
+        if not document_ids:
+            continue
+        normalized_tasks.append(
+            {
+                "task_id": str(raw_task.get("task_id") or "").strip()
+                or f"task-{index}",
+                "subquery": subquery,
+                "document_ids": document_ids,
+            }
+        )
+
+    return normalized_tasks
+
+
+def _interleave_task_hits(
+    *,
+    task_results: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    ordered_hits: list[dict[str, Any]] = []
+    hit_lists = [list(task_result.get("retrievals") or []) for task_result in task_results]
+    max_length = max((len(hits) for hits in hit_lists), default=0)
+    for index in range(max_length):
+        for task_result, hits in zip(task_results, hit_lists, strict=False):
+            if index >= len(hits):
+                continue
+            ordered_hits.append(
+                {
+                    **dict(hits[index]),
+                    "retrieval_task_id": str(task_result.get("task_id") or "").strip()
+                    or None,
+                    "retrieval_task_query": str(task_result.get("subquery") or "").strip()
+                    or None,
+                }
+            )
+            if len(ordered_hits) >= limit:
+                return ordered_hits
+    return ordered_hits
+
+
+def _postprocess_task_hits(
+    *,
+    task_results: list[dict[str, Any]],
+    embedding_client: OpenAIEmbeddingClient,
+    resolved_top_k: int,
+    resolved_enable_rerank: bool,
+    resolved_rerank_model: str,
+    resolved_rerank_device: str,
+) -> tuple[list[dict[str, Any]], bool, str | None]:
+    processed_task_results: list[dict[str, Any]] = []
+    rerank_applied = False
+    rerank_errors: list[str] = []
+    per_task_keep = max(1, min(4, resolved_top_k))
+
+    for task_result in task_results:
+        processed = _apply_global_postprocess_to_hits(
+            normalized_query=str(task_result.get("subquery") or "").strip(),
+            retrieval_hits=list(task_result.get("retrievals") or []),
+            embedding_client=embedding_client,
+            resolved_top_k=per_task_keep,
+            resolved_enable_rerank=resolved_enable_rerank,
+            resolved_rerank_model=resolved_rerank_model,
+            resolved_rerank_device=resolved_rerank_device,
+            resolved_enable_mmr=False,
+            resolved_mmr_lambda_mult=STAGE4_MMR_LAMBDA_MULT,
+        )
+        rerank_applied = rerank_applied or bool(processed.get("rerank_applied"))
+        rerank_error = str(processed.get("rerank_error") or "").strip()
+        if rerank_error:
+            rerank_errors.append(rerank_error)
+        processed_task_results.append(
+            {
+                **task_result,
+                "retrievals": list(processed.get("retrievals") or []),
+            }
+        )
+
+    merged_limit = max(resolved_top_k, min(len(processed_task_results) * per_task_keep, 16))
+    merged_hits = _interleave_task_hits(
+        task_results=processed_task_results,
+        limit=merged_limit,
+    )
+    return (
+        merged_hits,
+        rerank_applied,
+        rerank_errors[0] if rerank_errors else None,
+    )
+
+
 def search_thread_knowledge(
     *,
     query: str,
     thread_id: str | None,
     active_document_ids: list[str] | None = None,
+    retrieval_tasks: list[dict[str, Any]] | None = None,
     document_queries: dict[str, str] | None = None,
     collection_name: str | None = None,
     retrieval_mode: str | None = None,
@@ -414,6 +533,10 @@ def search_thread_knowledge(
         for document_id, document_query in dict(document_queries or {}).items()
         if str(document_id).strip() in normalized_document_ids and str(document_query).strip()
     }
+    normalized_retrieval_tasks = _normalize_retrieval_tasks_input(
+        retrieval_tasks=retrieval_tasks,
+        fallback_document_ids=normalized_document_ids,
+    )
 
     qdrant_configured = bool((qdrant_client is not None or STAGE4_QDRANT_URL) and resolved_collection_name)
     if not qdrant_configured:
@@ -435,7 +558,101 @@ def search_thread_knowledge(
     )
 
     try:
-        if resolved_use_per_document_search and len(normalized_document_ids) > 1:
+        executed_task_search = False
+        executed_per_document_search = False
+        if normalized_retrieval_tasks:
+            executed_task_search = True
+            resolved_task_top_k = max(
+                1,
+                int(per_document_top_k or resolved_top_k),
+            )
+            ordered_task_results: list[dict[str, Any] | None] = [None] * len(
+                normalized_retrieval_tasks
+            )
+            with ThreadPoolExecutor(
+                max_workers=min(4, len(normalized_retrieval_tasks))
+            ) as executor:
+                future_entries = [
+                    (
+                        index,
+                        task,
+                        executor.submit(
+                            _run_scoped_retrieval,
+                            normalized_query=str(task.get("subquery") or "").strip()
+                            or normalized_query,
+                            normalized_thread_id=normalized_thread_id,
+                            normalized_document_ids=list(task.get("document_ids") or []),
+                            resolved_collection_name=resolved_collection_name,
+                            resolved_retrieval_mode=resolved_retrieval_mode,
+                            resolved_top_k=resolved_task_top_k,
+                            resolved_fetch_k=resolved_fetch_k,
+                            resolved_dense_fetch_k=resolved_dense_fetch_k,
+                            resolved_bm25_fetch_k=resolved_bm25_fetch_k,
+                            resolved_hybrid_rrf_weights=resolved_hybrid_rrf_weights,
+                            resolved_bm25_excluded_role_hints=resolved_bm25_excluded_role_hints,
+                            resolved_restrict_to_document=resolved_restrict_to_document,
+                            resolved_score_threshold=resolved_score_threshold,
+                            resolved_enable_score_fallback=resolved_enable_score_fallback,
+                            resolved_enable_rerank=False,
+                            resolved_rerank_model=resolved_rerank_model,
+                            resolved_rerank_device=resolved_rerank_device,
+                            resolved_enable_mmr=False,
+                            resolved_mmr_lambda_mult=resolved_mmr_lambda_mult,
+                            embedding_client=embedding_client,
+                            qdrant_client=qdrant_client,
+                        ),
+                    )
+                    for index, task in enumerate(normalized_retrieval_tasks)
+                ]
+                for index, task, future in future_entries:
+                    task_result = dict(future.result())
+                    task_result["task_id"] = str(task.get("task_id") or "").strip()
+                    task_result["subquery"] = str(task.get("subquery") or "").strip()
+                    task_result["document_ids"] = list(task.get("document_ids") or [])
+                    ordered_task_results[index] = task_result
+
+            task_results = [
+                item for item in ordered_task_results if item is not None
+            ]
+            score_fallback_applied = any(
+                bool(item.get("score_fallback_applied")) for item in task_results
+            )
+            effective_score_threshold = (
+                None if score_fallback_applied else resolved_score_threshold
+            )
+            if len(task_results) == 1:
+                single_task_result = task_results[0]
+                retrieval_result = _apply_global_postprocess_to_hits(
+                    normalized_query=str(
+                        single_task_result.get("subquery") or normalized_query
+                    ).strip()
+                    or normalized_query,
+                    retrieval_hits=list(single_task_result.get("retrievals") or []),
+                    embedding_client=embedding_client,
+                    resolved_top_k=resolved_top_k,
+                    resolved_enable_rerank=resolved_enable_rerank,
+                    resolved_rerank_model=resolved_rerank_model,
+                    resolved_rerank_device=resolved_rerank_device,
+                    resolved_enable_mmr=resolved_enable_mmr,
+                    resolved_mmr_lambda_mult=resolved_mmr_lambda_mult,
+                )
+            else:
+                merged_hits, rerank_applied, rerank_error = _postprocess_task_hits(
+                    task_results=task_results,
+                    embedding_client=embedding_client,
+                    resolved_top_k=resolved_top_k,
+                    resolved_enable_rerank=resolved_enable_rerank,
+                    resolved_rerank_model=resolved_rerank_model,
+                    resolved_rerank_device=resolved_rerank_device,
+                )
+                retrieval_result = {
+                    "retrievals": merged_hits,
+                    "rerank_applied": rerank_applied,
+                    "rerank_error": rerank_error,
+                    "mmr_applied": False,
+                }
+        elif resolved_use_per_document_search and len(normalized_document_ids) > 1:
+            executed_per_document_search = True
             resolved_per_document_top_k = max(
                 1,
                 int(
@@ -563,9 +780,10 @@ def search_thread_knowledge(
         "retrieval_mode": resolved_retrieval_mode,
         "top_k": resolved_top_k,
         "fetch_k": resolved_fetch_k,
-        "per_document_search_used": bool(
-            resolved_use_per_document_search and len(normalized_document_ids) > 1
-        ),
+        "task_search_used": executed_task_search,
+        "retrieval_task_count": len(normalized_retrieval_tasks),
+        "retrieval_tasks": normalized_retrieval_tasks,
+        "per_document_search_used": executed_per_document_search,
         "score_threshold_applied": effective_score_threshold,
         "score_fallback_applied": score_fallback_applied,
         "rerank_applied": bool(retrieval_result.get("rerank_applied")),

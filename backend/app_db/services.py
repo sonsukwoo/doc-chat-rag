@@ -66,6 +66,26 @@ class VisualAssetPayload(TypedDict, total=False):
     pages: list[int]
 
 
+class DocumentOverviewHitPayload(TypedDict, total=False):
+    """문서 요약/개요 질문에 사용할 대표 본문 블록."""
+
+    point_id: str
+    document_id: str
+    chunk_id: str
+    parent_id: str | None
+    score: float
+    chunk_type: str
+    text: str
+    section_title: str | None
+    primary_page: int | None
+    page_start: int | None
+    page_end: int | None
+    has_asset: bool
+    context_text: str | None
+    context_chunk_ids: list[str]
+    expansion_mode: str
+
+
 def _normalize_document_ids(active_document_ids: list[str] | None) -> list[str]:
     return [
         str(item).strip()
@@ -700,6 +720,144 @@ def load_expanded_context_blocks(
         )
 
     return context_blocks
+
+
+def _select_representative_rows(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """문서 전체 개요에 쓸 앞/중간/뒤 대표 row를 안정적으로 고른다."""
+    if limit <= 0 or not rows:
+        return []
+    if len(rows) <= limit:
+        return list(rows)
+
+    selected_indices = {0, len(rows) - 1}
+    if limit > 2:
+        step = (len(rows) - 1) / float(limit - 1)
+        for offset in range(1, limit - 1):
+            selected_indices.add(round(offset * step))
+
+    return [rows[index] for index in sorted(selected_indices)[:limit]]
+
+
+def _truncate_overview_text(value: str, *, max_chars: int) -> str:
+    normalized = str(value or "").strip()
+    if max_chars <= 0 or len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[: max_chars - 1].rstrip()}…"
+
+
+def load_document_overview_chunks(
+    *,
+    thread_id: str | None,
+    active_document_ids: list[str],
+    max_blocks_per_document: int = 6,
+    max_chars_per_block: int = 1800,
+) -> list[DocumentOverviewHitPayload]:
+    """문서 전체 요약/개요 질문용 대표 본문 블록을 Postgres에서 읽는다."""
+    del thread_id
+    normalized_document_ids = _normalize_document_ids(active_document_ids)
+    if not normalized_document_ids:
+        return []
+
+    with app_db_connection() as connection:
+        document_repository = DocumentRepository(connection)
+        parent_rows = document_repository.list_document_parents(normalized_document_ids)
+        chunk_rows = document_repository.list_document_chunks(normalized_document_ids)
+
+    chunks_by_parent: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    chunks_by_document: dict[str, list[dict[str, Any]]] = {}
+    for row in chunk_rows:
+        document_id = str(row.get("document_id") or "").strip()
+        chunk_id = str(row.get("chunk_id") or "").strip()
+        parent_id = str(row.get("parent_id") or "").strip()
+        if not document_id or not chunk_id:
+            continue
+        chunks_by_document.setdefault(document_id, []).append(row)
+        if parent_id:
+            chunks_by_parent.setdefault((document_id, parent_id), []).append(row)
+
+    parents_by_document: dict[str, list[dict[str, Any]]] = {}
+    for row in parent_rows:
+        document_id = str(row.get("document_id") or "").strip()
+        if document_id:
+            parents_by_document.setdefault(document_id, []).append(row)
+
+    overview_hits: list[DocumentOverviewHitPayload] = []
+    for document_id in normalized_document_ids:
+        selected_parent_rows = _select_representative_rows(
+            parents_by_document.get(document_id, []),
+            limit=max(1, max_blocks_per_document),
+        )
+        if selected_parent_rows:
+            for index, row in enumerate(selected_parent_rows, start=1):
+                parent_id = str(row.get("parent_id") or "").strip()
+                child_rows = chunks_by_parent.get((document_id, parent_id), [])
+                context_chunk_ids = [
+                    str(item.get("chunk_id") or "").strip()
+                    for item in child_rows
+                    if str(item.get("chunk_id") or "").strip()
+                ]
+                overview_hits.append(
+                    {
+                        "point_id": f"overview:{document_id}:{parent_id or index}",
+                        "document_id": document_id,
+                        "chunk_id": context_chunk_ids[0] if context_chunk_ids else f"overview-{index}",
+                        "parent_id": parent_id or None,
+                        "score": 1.0,
+                        "chunk_type": "overview",
+                        "text": _truncate_overview_text(
+                            str(row.get("body_text") or ""),
+                            max_chars=max_chars_per_block,
+                        ),
+                        "section_title": row.get("section_title"),
+                        "primary_page": row.get("page_start"),
+                        "page_start": row.get("page_start"),
+                        "page_end": row.get("page_end"),
+                        "has_asset": False,
+                        "context_text": _truncate_overview_text(
+                            str(row.get("body_text") or ""),
+                            max_chars=max_chars_per_block,
+                        ),
+                        "context_chunk_ids": context_chunk_ids,
+                        "expansion_mode": "document_overview",
+                    }
+                )
+            continue
+
+        selected_chunk_rows = _select_representative_rows(
+            chunks_by_document.get(document_id, []),
+            limit=max(1, max_blocks_per_document),
+        )
+        for index, row in enumerate(selected_chunk_rows, start=1):
+            chunk_id = str(row.get("chunk_id") or "").strip()
+            text = _truncate_overview_text(
+                str(row.get("text") or ""),
+                max_chars=max_chars_per_block,
+            )
+            overview_hits.append(
+                {
+                    "point_id": f"overview:{document_id}:{chunk_id or index}",
+                    "document_id": document_id,
+                    "chunk_id": chunk_id or f"overview-{index}",
+                    "parent_id": str(row.get("parent_id") or "").strip() or None,
+                    "score": 1.0,
+                    "chunk_type": str(row.get("chunk_type") or "overview"),
+                    "text": text,
+                    "section_title": None,
+                    "primary_page": row.get("page_start"),
+                    "page_start": row.get("page_start"),
+                    "page_end": row.get("page_end"),
+                    "has_asset": False,
+                    "context_text": text,
+                    "context_chunk_ids": [chunk_id] if chunk_id else [],
+                    "expansion_mode": "document_overview",
+                }
+            )
+
+    return overview_hits
 
 
 def load_visual_assets(

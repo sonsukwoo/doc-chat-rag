@@ -101,7 +101,7 @@ class ChatServiceTests(unittest.TestCase):
             HumanMessage(content="1번 문서 설명"),
             AIMessage(
                 content="문서 요약 답변입니다.",
-                name="stage5_profile_answer",
+                name="stage5_legacy_answer",
                 additional_kwargs={
                     "thread_chat": {
                         "citations": [],

@@ -73,6 +73,9 @@ class ChatbotToolTracePayload(TypedDict, total=False):
     rerank_error: str | None
     mmr_requested: bool | None
     mmr_applied: bool | None
+    task_search_used: bool | None
+    overview_search_used: bool | None
+    retrieval_task_count: int | None
     per_document_search_used: bool | None
     score_threshold_applied: float | None
     score_fallback_applied: bool | None
@@ -80,6 +83,18 @@ class ChatbotToolTracePayload(TypedDict, total=False):
     fetch_k: int | None
     block_count: int | None
     message: str | None
+
+
+class ChatbotRetrievalTaskPayload(TypedDict, total=False):
+    """planner가 생성한 검색 task 요약."""
+
+    task_id: str
+    subquery: str
+    user_question: str
+    search_query: str
+    task_type: str
+    retrieval_strategy: str
+    document_ids: list[str]
 
 
 class ChatbotDebugTracePayload(TypedDict, total=False):
@@ -93,6 +108,7 @@ class ChatbotDebugTracePayload(TypedDict, total=False):
     selection_reason: str
     selected_document_ids: list[str]
     selected_document_queries: dict[str, str]
+    retrieval_tasks: list[ChatbotRetrievalTaskPayload]
     thread_default_retrieval_mode: str | None
     retrieval_mode: str | None
     executed_retrieval_mode: str | None

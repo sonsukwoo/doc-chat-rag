@@ -93,6 +93,7 @@ def build_search_thread_knowledge_tool(
             query=query,
             thread_id=resolved_thread_id,
             active_document_ids=document_ids,
+            retrieval_tasks=list(state.get("retrieval_tasks") or []),
             document_queries=dict(state.get("retrieval_document_queries") or {}),
             collection_name=collection_name,
             retrieval_mode=retrieval_mode,
