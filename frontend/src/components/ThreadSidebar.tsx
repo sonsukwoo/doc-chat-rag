@@ -1,4 +1,8 @@
 import type { ThreadRecord } from "../types";
+import {
+  getThreadLifecycleLabel,
+  getThreadLifecycleTone,
+} from "../lib/threadUi";
 
 type ThreadSidebarProps = {
   threads: ThreadRecord[];
@@ -38,6 +42,8 @@ export function ThreadSidebar({
         <div className="workspace-brand-mark">DC</div>
         <div>
           <p className="eyebrow">Doc Chat</p>
+          <h1>문서 채팅</h1>
+          <span>스레드별 문서와 대화를 분리합니다.</span>
         </div>
       </div>
 
@@ -63,6 +69,7 @@ export function ThreadSidebar({
           {threads.map((thread) => {
             const isActive = thread.thread_id === selectedThreadId;
             const isDeleting = deletingThreadId === thread.thread_id;
+            const lifecycleTone = getThreadLifecycleTone(thread);
             return (
               <article
                 key={thread.thread_id}
@@ -75,6 +82,9 @@ export function ThreadSidebar({
                 >
                   <div className="thread-list-item-top">
                     <strong>{thread.thread_name}</strong>
+                    <span className={`thread-status-pill is-${lifecycleTone}`}>
+                      {getThreadLifecycleLabel(thread)}
+                    </span>
                   </div>
                   <div className="thread-list-item-meta">
                     <span>{thread.document_count} docs</span>

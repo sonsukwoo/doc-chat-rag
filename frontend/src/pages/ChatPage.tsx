@@ -14,6 +14,7 @@ import {
   sendThreadChatMessage,
 } from "../lib/api";
 import {
+  getThreadLifecycleLabel,
   isThreadReady,
 } from "../lib/threadUi";
 import type {
@@ -451,16 +452,22 @@ export function ChatPage() {
             <div className="chat-header-title-row">
               <h2>{thread?.thread_name || "채팅방"}</h2>
             </div>
+            <div className="chat-header-kpis">
+              <span>{getThreadLifecycleLabel(thread)}</span>
+              <span>{documents.length} docs</span>
+              <span>기본 {thread?.default_retrieval_mode || "dense"}</span>
+            </div>
           </div>
 
           <div className="chat-header-actions">
             <button
-              className={`icon-button ${showThreadPanel ? "is-active" : ""}`}
+              className={`icon-button panel-toggle-button ${showThreadPanel ? "is-active" : ""}`}
               type="button"
-              aria-label="채팅방 정보 열기"
+              aria-label="문서와 채팅방 정보 열기"
               onClick={() => setShowThreadPanel((current) => !current)}
             >
               <ThreadPanelIcon open={showThreadPanel} />
+              <span>문서</span>
             </button>
           </div>
         </header>
@@ -495,7 +502,10 @@ export function ChatPage() {
                       <button
                         key={suggestion}
                         className="chat-suggestion-chip"
-                        onClick={() => setInputValue(suggestion)}
+                        onClick={() => {
+                          setInputValue(suggestion);
+                          window.setTimeout(() => textareaRef.current?.focus(), 0);
+                        }}
                       >
                         {suggestion}
                       </button>

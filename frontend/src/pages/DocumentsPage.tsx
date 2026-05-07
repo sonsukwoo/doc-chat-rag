@@ -26,6 +26,29 @@ export function DocumentsPage() {
       ),
     [threads],
   );
+  const canCreateThread = Boolean(threadName.trim() && bootstrapFile && !busy);
+
+  function suggestThreadName(file: File): string {
+    return file.name.replace(/\.pdf$/i, "").replace(/[_-]+/g, " ").trim();
+  }
+
+  function isPdfFile(file: File): boolean {
+    return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+  }
+
+  function setBootstrapPdf(file: File | null) {
+    if (file && !isPdfFile(file)) {
+      setBootstrapFile(null);
+      setErrorMessage("PDF 파일만 업로드할 수 있습니다.");
+      return;
+    }
+
+    setBootstrapFile(file);
+    setErrorMessage(null);
+    if (file && !threadName.trim()) {
+      setThreadName(suggestThreadName(file));
+    }
+  }
 
   async function refreshThreads() {
     const response = await listThreads();
@@ -81,7 +104,7 @@ export function DocumentsPage() {
     event.preventDefault();
     const file = event.dataTransfer.files?.[0];
     if (file) {
-      setBootstrapFile(file);
+      setBootstrapPdf(file);
     }
   }
 
@@ -136,54 +159,21 @@ export function DocumentsPage() {
 
         <section className="thread-launcher">
           <div className="thread-launcher-copy">
-            <p className="eyebrow">Start</p>
+            <p className="eyebrow">Start with a PDF</p>
             <h2>
               {sortedThreads.length === 0
-                ? "첫 채팅방을 만들고 문서 검수부터 시작하세요"
-                : "새 채팅방을 만들고 PDF를 바로 올리세요"}
+                ? "문서를 올리면 바로 대화 준비가 시작됩니다"
+                : "새 문서 묶음을 만들고 바로 질문하세요"}
             </h2>
             <p className="muted-text">
-              문서를 올리면 stage1, stage2 후 바로 검수 화면으로 이동하고, 끝나면 채팅방별로
-              대화를 이어갈 수 있습니다.
+              PDF를 선택하면 이름은 자동으로 채우고, 다음 화면에서 검수만 끝내면 채팅할 수 있습니다.
             </p>
           </div>
 
           <form
-            className="thread-launcher-card"
+            className={`thread-launcher-card ${bootstrapFile ? "has-file" : ""}`}
             onSubmit={(event) => void handleBootstrapSubmit(event)}
           >
-            <div className="thread-launcher-row">
-              <label className="field-group">
-                <span>채팅방 이름</span>
-                <input
-                  className="input"
-                  value={threadName}
-                  onChange={(event) => setThreadName(event.target.value)}
-                  placeholder="예: 피부질환 논문 QA"
-                />
-              </label>
-
-              <label className="field-group">
-                <span>기본 검색 모드</span>
-                <select
-                  className="input"
-                  value={defaultRetrievalMode}
-                  onChange={(event) =>
-                    setDefaultRetrievalMode(event.target.value as "dense" | "hybrid")
-                  }
-                >
-                  <option value="dense">dense</option>
-                  <option value="hybrid">hybrid</option>
-                </select>
-              </label>
-            </div>
-
-            <div className="thread-launcher-steps">
-              <span>1. PDF 업로드</span>
-              <span>2. 검수 진행</span>
-              <span>3. 채팅 시작</span>
-            </div>
-
             <label
               className={`upload-dropzone compact thread-launcher-dropzone ${busy ? "is-busy" : ""}`}
               onDragOver={(event) => event.preventDefault()}
@@ -192,16 +182,50 @@ export function DocumentsPage() {
               <input
                 type="file"
                 accept="application/pdf"
-                onChange={(event) => setBootstrapFile(event.target.files?.[0] || null)}
+                onChange={(event) => setBootstrapPdf(event.target.files?.[0] || null)}
               />
               <div className="upload-dropzone-content">
-                <strong>{bootstrapFile ? bootstrapFile.name : "첫 PDF 문서를 선택하세요"}</strong>
-                <span>업로드 직후 검수 화면으로 이동합니다.</span>
+                <strong>{bootstrapFile ? bootstrapFile.name : "PDF를 끌어오거나 클릭해서 선택"}</strong>
+                <span>{bootstrapFile ? "이 문서로 새 채팅방을 준비합니다." : "첫 문서만 고르면 다음 단계로 이어집니다."}</span>
               </div>
             </label>
 
-            <div className="detail-actions">
-              <button className="primary-button thread-primary-action" type="submit" disabled={busy}>
+            <div className="thread-launcher-row">
+              <label className="field-group thread-name-field">
+                <span>채팅방 이름</span>
+                <input
+                  className="input"
+                  value={threadName}
+                  onChange={(event) => setThreadName(event.target.value)}
+                  placeholder="파일을 선택하면 자동 입력됩니다"
+                />
+              </label>
+
+              <details className="advanced-settings">
+                <summary>검색 설정</summary>
+                <label className="field-group">
+                  <span>기본 검색 모드</span>
+                  <select
+                    className="input"
+                    value={defaultRetrievalMode}
+                    onChange={(event) =>
+                      setDefaultRetrievalMode(event.target.value as "dense" | "hybrid")
+                    }
+                  >
+                    <option value="dense">dense</option>
+                    <option value="hybrid">hybrid</option>
+                  </select>
+                </label>
+              </details>
+            </div>
+
+            <div className="thread-launcher-footer">
+              <div className="thread-launcher-steps">
+                <span>PDF</span>
+                <span>검수</span>
+                <span>채팅</span>
+              </div>
+              <button className="primary-button thread-primary-action" type="submit" disabled={!canCreateThread}>
                 {busy ? "준비 중..." : "채팅방 만들고 검수 시작"}
               </button>
             </div>

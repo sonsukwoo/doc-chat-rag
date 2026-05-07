@@ -211,7 +211,7 @@ flowchart TD
     order --> md["render_markdown"]
     md --> html["render_preview_html"]
     html --> write["write_outputs"]
-    write --> end(("END"))
+    write --> finish(("END"))
 
     style profile fill:#e9f7ef,stroke:#2f7d4a,color:#111
     style figureReview fill:#fff3e0,stroke:#ef6c00,color:#111
@@ -300,8 +300,8 @@ flowchart TD
     deeper --> grounding
     clarify --> intent
 
-    direct --> end(("END"))
-    compose --> end
+    direct --> finish(("END"))
+    compose --> finish
 
     style intent fill:#e8f0fe,stroke:#315a9e,color:#111
     style plan fill:#e9f7ef,stroke:#2f7d4a,color:#111
